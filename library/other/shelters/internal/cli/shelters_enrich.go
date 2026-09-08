@@ -13,6 +13,7 @@ package cli
 
 import (
 	"context"
+	"fmt"
 	"net/url"
 	"strings"
 	"time"
@@ -76,8 +77,12 @@ func femaNSSEnrich(ctx context.Context) (map[int]Shelter, error) {
 	v.Set("outFields", strings.Join(enrichOutFields, ","))
 	v.Set("returnGeometry", "false")
 	v.Set("f", "json")
-	u := openSheltersBase + femaNSSQuery + "?" + v.Encode()
-	body, err := httpGetJSON(ctx, u)
+	body, err := fetchArcGISPages(ctx, arcGISQuery{
+		URL:                openSheltersBase + femaNSSQuery,
+		OIDField:           "objectid",
+		PageSize:           4000,
+		SupportsPagination: true,
+	}, v)
 	if err != nil {
 		return nil, err
 	}
@@ -216,7 +221,7 @@ func applyEnrichment(ctx context.Context, flags *rootFlags, shelters []Shelter, 
 	}
 	em, err := fetchEnrichment(ctx)
 	if err != nil {
-		return enrichState{Attempted: true, Note: "Enrichment (FEMA_NSS/0) fetch failed; the extended fields are null. Spine data is unaffected."}
+		return enrichState{Attempted: true, Note: fmt.Sprintf("Enrichment (FEMA_NSS/0) fetch failed: %v; the extended fields are null. Spine data is unaffected.", err)}
 	}
 	mergeEnrichment(shelters, em)
 	return enrichState{Attempted: true, OK: true}

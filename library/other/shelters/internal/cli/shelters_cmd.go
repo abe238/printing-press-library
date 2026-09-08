@@ -43,14 +43,20 @@ func loadShelterFeed(cmd *cobra.Command, flags *rootFlags, fixture string) (shel
 		if perr != nil {
 			return shelterFeed{}, usageErr(perr)
 		}
-		return shelterFeed{
+		feed := shelterFeed{
 			Source:    "fixture:" + fixture,
 			Shelters:  shelters,
 			Enrich:    enrichState{Note: "Enrichment (FEMA_NSS/0) is skipped in --fixture mode; the fixture is the OpenShelters spine only."},
 			RedCross:  enrichState{Note: "Red Cross union is skipped in --fixture mode; the fixture is the OpenShelters spine only."},
 			Occupancy: enrichState{Note: "Live occupancy (Open_Shelters) is skipped in --fixture mode; the fixture is the OpenShelters spine only."},
-			Hidden:    enrichState{Note: "Red Cross hidden-shelter filtering is skipped in --fixture mode; the fixture is the OpenShelters spine only."},
-		}, nil
+		}
+		ctx, cancel := boundCtx(cmd.Context(), flags)
+		defer cancel()
+		feed.Hidden, err = applyHiddenSuppression(ctx, flags, &feed, "fixture")
+		if err != nil {
+			return shelterFeed{}, err
+		}
+		return feed, nil
 	}
 	c, err := flags.newClient()
 	if err != nil {
@@ -97,7 +103,10 @@ func loadShelterFeed(cmd *cobra.Command, flags *rootFlags, fixture string) (shel
 	// Suppress LAST: drop any shelter the Red Cross keeps off its public map
 	// (hide_from_public != 'No'), even one FEMA's public feed lists, so the CLI
 	// never surfaces a site the Red Cross has hidden. Conservative by design.
-	feed.Hidden = applyHiddenSuppression(ctx, flags, &feed, prov.Source)
+	feed.Hidden, err = applyHiddenSuppression(ctx, flags, &feed, prov.Source)
+	if err != nil {
+		return shelterFeed{}, err
+	}
 	return feed, nil
 }
 

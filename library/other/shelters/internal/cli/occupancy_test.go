@@ -119,12 +119,15 @@ func TestOverlayOccupancyFillsPublicOnly(t *testing.T) {
 		{Name: "Lincoln Community Center", State: "IN", Zip: "46322", Source: "occupancy", TotalPopulation: &pop, EvacuationCapacity: &evac}, // matches base #1
 		{Name: "Operational Only Shelter", State: "LA", Zip: "70501", Source: "occupancy", TotalPopulation: &pop},                            // non-public: must be withheld
 	}
-	out, filled, withheld := overlayOccupancy(base, occ)
+	out, filled, withheld, ambiguous := overlayOccupancy(base, occ)
 	if len(out) != 2 {
 		t.Fatalf("overlay size = %d, want 2 (fill-only never adds the non-public row)", len(out))
 	}
 	if filled != 1 || withheld != 1 {
 		t.Errorf("filled=%d withheld=%d, want filled=1 withheld=1", filled, withheld)
+	}
+	if ambiguous != 0 {
+		t.Errorf("ambiguous=%d, want 0", ambiguous)
 	}
 	byName := map[string]Shelter{}
 	for _, s := range out {
@@ -157,12 +160,56 @@ func TestOverlayOccupancyDoubleMatch(t *testing.T) {
 		{Name: "Shared Name", State: "TX", Source: "occupancy", TotalPopulation: &p1},
 		{Name: "Shared Name", State: "TX", Source: "occupancy", TotalPopulation: &p2},
 	}
-	out, filled, withheld := overlayOccupancy(base, occ)
+	out, filled, withheld, ambiguous := overlayOccupancy(base, occ)
 	if len(out) != 1 {
 		t.Fatalf("double-match = %d rows, want 1 (fill-only adds nothing)", len(out))
 	}
 	if filled != 1 || withheld != 1 {
 		t.Errorf("filled=%d withheld=%d, want filled=1 withheld=1", filled, withheld)
+	}
+	if ambiguous != 0 {
+		t.Errorf("ambiguous=%d, want 0", ambiguous)
+	}
+}
+
+// TestOverlayOccupancyWithholdsAmbiguousMatch prevents a population from being
+// assigned when two public shelters share the same name and state and the
+// occupancy row has no usable ZIP to distinguish them.
+func TestOverlayOccupancyWithholdsAmbiguousMatch(t *testing.T) {
+	pop := 25
+	base := []Shelter{
+		{ShelterID: 1, Name: "Shared Name", State: "TX", Zip: "75001", Source: "fema"},
+		{ShelterID: 2, Name: "Shared Name", State: "TX", Zip: "75002", Source: "fema"},
+	}
+	occ := []Shelter{{Name: "Shared Name", State: "TX", Source: "occupancy", TotalPopulation: &pop}}
+
+	out, filled, withheld, ambiguous := overlayOccupancy(base, occ)
+	if filled != 0 || withheld != 0 || ambiguous != 1 {
+		t.Fatalf("filled=%d withheld=%d ambiguous=%d, want 0 / 0 / 1", filled, withheld, ambiguous)
+	}
+	for _, s := range out {
+		if s.TotalPopulation != nil {
+			t.Errorf("shelter_id %d received ambiguous population %v", s.ShelterID, *s.TotalPopulation)
+		}
+	}
+}
+
+// TestOverlayOccupancyPrefersExactZIP verifies an exact ZIP5 resolves a choice
+// that would otherwise be ambiguous because another same-name row has no ZIP.
+func TestOverlayOccupancyPrefersExactZIP(t *testing.T) {
+	pop := 25
+	base := []Shelter{
+		{ShelterID: 1, Name: "Shared Name", State: "TX", Source: "fema"},
+		{ShelterID: 2, Name: "Shared Name", State: "TX", Zip: "75002", Source: "fema"},
+	}
+	occ := []Shelter{{Name: "Shared Name", State: "TX", Zip: "75002-1234", Source: "occupancy", TotalPopulation: &pop}}
+
+	out, filled, withheld, ambiguous := overlayOccupancy(base, occ)
+	if filled != 1 || withheld != 0 || ambiguous != 0 {
+		t.Fatalf("filled=%d withheld=%d ambiguous=%d, want 1 / 0 / 0", filled, withheld, ambiguous)
+	}
+	if out[0].TotalPopulation != nil || out[1].TotalPopulation == nil || *out[1].TotalPopulation != 25 {
+		t.Fatalf("exact ZIP occupancy assigned to wrong candidate: %+v", out)
 	}
 }
 
@@ -263,6 +310,24 @@ func TestApplyOccupancyOverlay(t *testing.T) {
 	}
 	if !strings.Contains(st.Note, "Withheld 1") {
 		t.Errorf("success note should report the withheld non-public shelter: %q", st.Note)
+	}
+
+	// Ambiguity is counted separately from operational-only rows and reported.
+	stubOccupancy(t, func(context.Context) ([]Shelter, error) {
+		return []Shelter{{Name: "Same", State: "TX", TotalPopulation: &pop}}, nil
+	})
+	feedAmbiguous := &shelterFeed{Shelters: []Shelter{
+		{ShelterID: 1, Name: "Same", State: "TX", Zip: "75001", Source: "fema"},
+		{ShelterID: 2, Name: "Same", State: "TX", Zip: "75002", Source: "fema"},
+	}}
+	stAmbiguous := applyOccupancyOverlay(context.Background(), &rootFlags{dataSource: "auto"}, feedAmbiguous, "live")
+	if !strings.Contains(stAmbiguous.Note, "Withheld occupancy for 1") {
+		t.Errorf("ambiguous note = %q, want separately reported count", stAmbiguous.Note)
+	}
+	for _, s := range feedAmbiguous.Shelters {
+		if s.TotalPopulation != nil {
+			t.Errorf("ambiguous occupancy assigned to shelter_id %d", s.ShelterID)
+		}
 	}
 
 	// Degrade path: a fetch error must not fail the command.

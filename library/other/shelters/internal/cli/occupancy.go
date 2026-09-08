@@ -63,7 +63,12 @@ func occupancyFetch(ctx context.Context) ([]Shelter, error) {
 	v.Set("outFields", strings.Join(occOutFields, ","))
 	v.Set("returnGeometry", "false")
 	v.Set("f", "json")
-	body, err := httpGet(ctx, redCrossBase+openSheltersOccQuery+"?"+v.Encode(), "")
+	body, err := fetchArcGISPages(ctx, arcGISQuery{
+		URL:                redCrossBase + openSheltersOccQuery,
+		OIDField:           "OBJECTID",
+		PageSize:           4000,
+		SupportsPagination: true,
+	}, v)
 	if err != nil {
 		return nil, err
 	}
@@ -141,9 +146,9 @@ func cleanCity(s string) string {
 // corroboration (it is absent from both FEMA's public feed and the public Red
 // Cross EA view) and no visibility flag to consult, the CLI does not surface it.
 // The base slice is copied so the caller's slice is not mutated underneath it.
-// Returns the filled slice plus the counts of shelters filled and operational-only
-// rows withheld.
-func overlayOccupancy(base, occ []Shelter) (out []Shelter, filled, withheld int) {
+// Returns the filled slice plus counts for shelters filled, operational-only
+// rows withheld, and ambiguous rows withheld.
+func overlayOccupancy(base, occ []Shelter) (out []Shelter, filled, withheld, ambiguous int) {
 	out = make([]Shelter, len(base))
 	copy(out, base)
 	idx := map[string][]int{}
@@ -157,14 +162,36 @@ func overlayOccupancy(base, occ []Shelter) (out []Shelter, filled, withheld int)
 			continue // no usable name -> cannot match; not counted as withheld
 		}
 		k := normName(r.Name) + "|" + r.State
-		matched := -1
+		candidates := make([]int, 0, len(idx[k]))
 		for _, ci := range idx[k] {
-			// Only fill an un-consumed base row; a second occupancy row that keys the
-			// same does not get its own row (fill-only), it is withheld like any other
-			// row without a distinct public match.
 			if !merged[ci] && zipCompatible(out[ci], r) {
-				matched = ci
-				break
+				candidates = append(candidates, ci)
+			}
+		}
+		matched := -1
+		switch len(candidates) {
+		case 0:
+			withheld++
+			continue
+		case 1:
+			matched = candidates[0]
+		default:
+			// A compatible missing ZIP must not let the first same-name row win.
+			// Prefer an exact ZIP5 only when it identifies exactly one candidate.
+			rowZIP := zip5(r.Zip)
+			exact := make([]int, 0, len(candidates))
+			if rowZIP != "" {
+				for _, ci := range candidates {
+					if zip5(out[ci].Zip) == rowZIP {
+						exact = append(exact, ci)
+					}
+				}
+			}
+			if len(exact) == 1 {
+				matched = exact[0]
+			} else {
+				ambiguous++
+				continue
 			}
 		}
 		if matched >= 0 {
@@ -172,11 +199,9 @@ func overlayOccupancy(base, occ []Shelter) (out []Shelter, filled, withheld int)
 			out[matched].Source = addOccupancySource(out[matched].Source)
 			merged[matched] = true
 			filled++
-		} else {
-			withheld++ // operational-only: not in any public feed, so not shown
 		}
 	}
-	return out, filled, withheld
+	return out, filled, withheld, ambiguous
 }
 
 // fillOccupancy folds an Open_Shelters record onto a unioned shelter. The
@@ -284,13 +309,16 @@ func applyOccupancyOverlay(ctx context.Context, flags *rootFlags, feed *shelterF
 	}
 	occ, err := fetchOccupancy(ctx)
 	if err != nil {
-		return enrichState{Attempted: true, Note: "Live occupancy (Red Cross Open_Shelters) unavailable; population and capacity are null where the other feeds did not report them. Spine data is unaffected."}
+		return enrichState{Attempted: true, Note: fmt.Sprintf("Live occupancy (Red Cross Open_Shelters) unavailable: %v; population and capacity are null where the other feeds did not report them. Spine data is unaffected.", err)}
 	}
-	var filled, withheld int
-	feed.Shelters, filled, withheld = overlayOccupancy(feed.Shelters, occ)
+	var filled, withheld, ambiguous int
+	feed.Shelters, filled, withheld, ambiguous = overlayOccupancy(feed.Shelters, occ)
 	note := fmt.Sprintf("Merged live occupancy onto %d publicly listed shelter(s).", filled)
 	if withheld > 0 {
 		note += fmt.Sprintf(" Withheld %d shelter(s) listed only in the Red Cross operational roster and not in either public feed; the CLI shows only publicly listed shelters.", withheld)
+	}
+	if ambiguous > 0 {
+		note += fmt.Sprintf(" Withheld occupancy for %d shelter row(s) because more than one public shelter matched; no population was assigned ambiguously.", ambiguous)
 	}
 	return enrichState{Attempted: true, OK: true, Note: note}
 }

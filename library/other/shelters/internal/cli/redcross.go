@@ -61,7 +61,13 @@ func redCrossFetch(ctx context.Context) ([]Shelter, error) {
 	v.Set("returnGeometry", "true")
 	v.Set("outSR", "4326") // return lat/lon directly; avoids Web Mercator math
 	v.Set("f", "json")
-	body, err := httpGet(ctx, redCrossBase+redCrossQuery+"?"+v.Encode(), redCrossReferer)
+	body, err := fetchArcGISPages(ctx, arcGISQuery{
+		URL:                redCrossBase + redCrossQuery,
+		Referer:            redCrossReferer,
+		OIDField:           "ObjectID",
+		PageSize:           1000,
+		SupportsPagination: true,
+	}, v)
 	if err != nil {
 		return nil, err
 	}
@@ -327,7 +333,7 @@ func applyRedCrossUnion(ctx context.Context, flags *rootFlags, feed *shelterFeed
 	}
 	rc, err := fetchRedCross(ctx)
 	if err != nil {
-		return enrichState{Attempted: true, Note: "Red Cross feed unavailable; results are FEMA OpenShelters only. Spine data is unaffected."}
+		return enrichState{Attempted: true, Note: fmt.Sprintf("Red Cross feed unavailable: %v; results are FEMA OpenShelters only. Spine data is unaffected.", err)}
 	}
 	before := len(feed.Shelters)
 	feed.Shelters = unionFeeds(feed.Shelters, rc)
@@ -351,36 +357,57 @@ func redCrossHiddenFetch(ctx context.Context) ([]Shelter, error) {
 	v.Set("outFields", strings.Join(rcOutFields, ","))
 	v.Set("returnGeometry", "false")
 	v.Set("f", "json")
-	body, err := httpGet(ctx, redCrossBase+redCrossQuery+"?"+v.Encode(), redCrossReferer)
+	body, err := fetchArcGISPages(ctx, arcGISQuery{
+		URL:                redCrossBase + redCrossQuery,
+		Referer:            redCrossReferer,
+		OIDField:           "ObjectID",
+		PageSize:           1000,
+		SupportsPagination: true,
+	}, v)
 	if err != nil {
 		return nil, err
 	}
 	return parseRedCross(body)
 }
 
+// streetKey normalizes the street portion of an address for identity matching:
+// everything before the first comma, with non-alphanumerics stripped. The Red
+// Cross carries a full "123 Main St, City, ST 12345" string while FEMA carries
+// the street alone, so keying on the whole address would never match across the
+// two feeds.
+func streetKey(addr string) string {
+	if i := strings.Index(addr, ","); i >= 0 {
+		addr = addr[:i]
+	}
+	return normName(addr)
+}
+
 // suppressHidden removes every shelter that matches a Red-Cross-hidden identity
-// (normalized name + state, with a compatible ZIP), no matter which feed put it in
-// the list -- so a FEMA-public shelter the Red Cross keeps off its public map is
-// dropped too. The conservative stance: the Red Cross's own decision to hide a site
-// (privacy, transitional, not cleared for walk-ins) wins over another feed listing
-// it. Returns the kept shelters (new backing array) and the number removed.
+// by normalized name + state with a compatible ZIP, or by normalized street
+// address + exact ZIP5. The address property catches name variants without an
+// alias table. A match from either source wins over another feed listing the
+// site. Returns the kept shelters and the number removed.
 func suppressHidden(shelters, hidden []Shelter) ([]Shelter, int) {
 	if len(hidden) == 0 {
 		return shelters, 0
 	}
-	deny := map[string][]Shelter{}
+	denyName := map[string][]Shelter{}
+	denyAddress := map[string]bool{}
 	for _, h := range hidden {
-		if normName(h.Name) == "" {
-			continue // no usable identity to match on
+		if name := normName(h.Name); name != "" {
+			k := name + "|" + h.State
+			denyName[k] = append(denyName[k], h)
 		}
-		k := normName(h.Name) + "|" + h.State
-		deny[k] = append(deny[k], h)
+		if address, zip := streetKey(h.Address), zip5(h.Zip); address != "" && zip != "" {
+			denyAddress[address+"|"+zip] = true
+		}
 	}
 	var kept []Shelter
 	removed := 0
 	for _, s := range shelters {
-		hide := false
-		for _, h := range deny[normName(s.Name)+"|"+s.State] {
+		address, zip := streetKey(s.Address), zip5(s.Zip)
+		hide := address != "" && zip != "" && denyAddress[address+"|"+zip]
+		for _, h := range denyName[normName(s.Name)+"|"+s.State] {
 			if zipCompatible(s, h) {
 				hide = true
 				break
@@ -395,22 +422,14 @@ func suppressHidden(shelters, hidden []Shelter) ([]Shelter, int) {
 	return kept, removed
 }
 
-// applyHiddenSuppression best-effort removes shelters the Red Cross keeps off its
-// public map and reports what happened. Skipped (no network) under --no-enrich or
-// offline data sources, like the other secondary fetches; a fetch failure degrades
-// to NO suppression with an honest note (we cannot identify the hidden sites, so
-// the feed is left unchanged), never an error. Run LAST, after every other feed, so
-// a hidden site is caught no matter which feed surfaced it.
-func applyHiddenSuppression(ctx context.Context, flags *rootFlags, feed *shelterFeed, spineSource string) enrichState {
-	if flags.noEnrich {
-		return enrichState{Note: "Red Cross hidden-shelter filtering skipped (--no-enrich); the raw FEMA spine may include a site the Red Cross keeps off its public map."}
-	}
-	if flags.dataSource == "local" || spineSource == "local" {
-		return enrichState{Note: "Red Cross hidden-shelter filtering skipped (offline / --data-source local)."}
-	}
+// applyHiddenSuppression removes shelters the Red Cross keeps off its public
+// map. This safety check always fetches the complete hidden set, independent of
+// enrichment and data-source choices. Failure is fatal so no unverified shelter
+// rows can be emitted. Run LAST so every feed is covered.
+func applyHiddenSuppression(ctx context.Context, _ *rootFlags, feed *shelterFeed, _ string) (enrichState, error) {
 	hidden, err := fetchRedCrossHidden(ctx)
 	if err != nil {
-		return enrichState{Attempted: true, Note: "Could not fetch the Red Cross hidden-shelter list; no shelters were suppressed, so a site the Red Cross keeps off its public map may appear. Spine data is unaffected."}
+		return enrichState{Attempted: true}, fmt.Errorf("cannot verify shelter visibility: %w; the Red Cross hidden-shelter list is required before shelters can be listed", err)
 	}
 	var removed int
 	feed.Shelters, removed = suppressHidden(feed.Shelters, hidden)
@@ -418,5 +437,5 @@ func applyHiddenSuppression(ctx context.Context, flags *rootFlags, feed *shelter
 	if removed > 0 {
 		note += fmt.Sprintf(" Suppressed %d shelter(s) the Red Cross keeps off its public map (not shown even though another feed listed them).", removed)
 	}
-	return enrichState{Attempted: true, OK: true, Note: note}
+	return enrichState{Attempted: true, OK: true, Note: note}, nil
 }

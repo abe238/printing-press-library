@@ -3,6 +3,7 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"strings"
@@ -301,12 +302,33 @@ func TestSuppressHidden(t *testing.T) {
 	}
 }
 
-// TestApplyHiddenSuppression exercises the skip, success, and degrade paths.
+// TestSuppressHiddenAddressIdentity locks the secondary privacy identity: a
+// name variant still suppresses when the normalized street address and ZIP5
+// identify the same physical site.
+func TestSuppressHiddenAddressIdentity(t *testing.T) {
+	shelters := []Shelter{{Name: "Saint Marys", Address: "One Synthetic Road", State: "TX", Zip: "75001", Source: "fema"}}
+	// The Red Cross carries the full address with a ", City, ST ZIP" tail while
+	// FEMA carries the street alone, so the key has to be the street portion.
+	hidden := []Shelter{{Name: "St. Mary's", Address: "ONE SYNTHETIC ROAD, Plano, TX 75001", State: "TX", Zip: "75001", Source: "redcross"}}
+
+	kept, removed := suppressHidden(shelters, hidden)
+	if removed != 1 || len(kept) != 0 {
+		t.Fatalf("address identity: removed=%d kept=%d, want 1 / 0", removed, len(kept))
+	}
+
+	// A different street at the same ZIP is a different site and must be kept.
+	other := []Shelter{{Name: "Two Synthetic Road Shelter", Address: "Two Synthetic Road", State: "TX", Zip: "75001", Source: "fema"}}
+	if kept, removed := suppressHidden(other, hidden); removed != 0 || len(kept) != 1 {
+		t.Errorf("different street: removed=%d kept=%d, want 0 / 1", removed, len(kept))
+	}
+}
+
+// TestApplyHiddenSuppression exercises mandatory checking across flag modes,
+// successful suppression, and fail-closed fetch errors.
 func TestApplyHiddenSuppression(t *testing.T) {
-	// Skip paths must not call the network.
+	// Optional-enrichment and offline choices do not bypass the safety check.
 	stubRedCrossHidden(t, func(context.Context) ([]Shelter, error) {
-		t.Fatal("fetchRedCrossHidden must not be called when suppression is skipped")
-		return nil, nil
+		return []Shelter{{Name: "X", State: "IN", Zip: "46201"}}, nil
 	})
 	for _, tc := range []struct {
 		name        string
@@ -318,13 +340,13 @@ func TestApplyHiddenSuppression(t *testing.T) {
 		{"spine-local", &rootFlags{dataSource: "auto"}, "local"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			feed := &shelterFeed{Source: "u", Shelters: []Shelter{{ShelterID: 1, Name: "X", State: "IN", Source: "fema"}}}
-			st := applyHiddenSuppression(context.Background(), tc.flags, feed, tc.spineSource)
-			if st.OK || st.Note == "" {
-				t.Errorf("%s: state = %+v, want skipped with note", tc.name, st)
+			feed := &shelterFeed{Source: "u", Shelters: []Shelter{{ShelterID: 1, Name: "X", State: "IN", Zip: "46201", Source: "fema"}}}
+			st, err := applyHiddenSuppression(context.Background(), tc.flags, feed, tc.spineSource)
+			if err != nil {
+				t.Fatalf("%s: applyHiddenSuppression: %v", tc.name, err)
 			}
-			if len(feed.Shelters) != 1 {
-				t.Errorf("%s: shelters changed despite skip", tc.name)
+			if !st.OK || len(feed.Shelters) != 0 {
+				t.Errorf("%s: state=%+v shelters=%d, want successful suppression", tc.name, st, len(feed.Shelters))
 			}
 		})
 	}
@@ -337,7 +359,10 @@ func TestApplyHiddenSuppression(t *testing.T) {
 		{ShelterID: 1, Name: "Lincoln Community Center", State: "IN", Zip: "46322", Source: "fema+occupancy"},
 		{ShelterID: 2, Name: "Family Life Community Church", State: "WA", Zip: "98001", Source: "fema"},
 	}}
-	st := applyHiddenSuppression(context.Background(), &rootFlags{dataSource: "auto"}, feed, "live")
+	st, err := applyHiddenSuppression(context.Background(), &rootFlags{dataSource: "auto"}, feed, "live")
+	if err != nil {
+		t.Fatalf("success path: %v", err)
+	}
 	if !st.OK {
 		t.Fatalf("success path: state = %+v, want OK", st)
 	}
@@ -348,16 +373,59 @@ func TestApplyHiddenSuppression(t *testing.T) {
 		t.Errorf("note should report the suppression: %q", st.Note)
 	}
 
-	// Degrade path: a fetch error must not fail the command and must not suppress.
+	// Failure path: an unavailable hidden set fails closed and leaves the feed
+	// untouched for the caller to discard without emitting rows.
 	stubRedCrossHidden(t, func(context.Context) ([]Shelter, error) {
 		return nil, errors.New("403 forbidden")
 	})
 	feed2 := &shelterFeed{Source: "u", Shelters: []Shelter{{ShelterID: 1, Name: "Lincoln Community Center", State: "IN", Zip: "46322", Source: "fema"}}}
-	st2 := applyHiddenSuppression(context.Background(), &rootFlags{dataSource: "auto"}, feed2, "live")
-	if st2.OK || !st2.Attempted || st2.Note == "" {
-		t.Errorf("degrade path: state = %+v, want attempted-but-not-OK with a note", st2)
+	st2, err := applyHiddenSuppression(context.Background(), &rootFlags{dataSource: "auto"}, feed2, "live")
+	if err == nil || !strings.Contains(err.Error(), "cannot verify shelter visibility: 403 forbidden") || !strings.Contains(err.Error(), "hidden-shelter list is required") {
+		t.Fatalf("failure error = %v, want clear fail-closed message", err)
+	}
+	if st2.OK || !st2.Attempted {
+		t.Errorf("failure state = %+v, want attempted and not OK", st2)
 	}
 	if len(feed2.Shelters) != 1 {
-		t.Errorf("degrade path: shelters changed on fetch failure: %d", len(feed2.Shelters))
+		t.Errorf("failure path: shelters changed on fetch failure: %d", len(feed2.Shelters))
 	}
+}
+
+// TestShelterCommandsFailClosed verifies a hidden-set failure emits no shelter
+// rows, while dry-run exits before the mandatory network check.
+func TestShelterCommandsFailClosed(t *testing.T) {
+	t.Run("fetch failure", func(t *testing.T) {
+		stubRedCrossHidden(t, func(context.Context) ([]Shelter, error) {
+			return nil, errors.New("network down")
+		})
+		var flags rootFlags
+		cmd := newRootCmd(&flags)
+		var stdout bytes.Buffer
+		cmd.SetOut(&stdout)
+		cmd.SetArgs([]string{"shelters", "--fixture", syntheticFixture, "--json"})
+		err := cmd.Execute()
+		if err == nil || ExitCode(err) == 0 {
+			t.Fatalf("Execute error = %v, want nonzero failure", err)
+		}
+		if stdout.Len() != 0 {
+			t.Fatalf("stdout = %q, want no shelter rows", stdout.String())
+		}
+	})
+
+	t.Run("dry run", func(t *testing.T) {
+		called := false
+		stubRedCrossHidden(t, func(context.Context) ([]Shelter, error) {
+			called = true
+			return nil, errors.New("must not run")
+		})
+		var flags rootFlags
+		cmd := newRootCmd(&flags)
+		cmd.SetArgs([]string{"shelters", "--fixture", syntheticFixture, "--dry-run"})
+		if err := cmd.Execute(); err != nil {
+			t.Fatalf("dry-run Execute: %v", err)
+		}
+		if called {
+			t.Fatal("dry-run fetched the Red Cross hidden-shelter list")
+		}
+	})
 }
