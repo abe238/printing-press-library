@@ -14,7 +14,7 @@
   "spec_path": "shelters.spec.yaml",
   "spec_format": "internal",
   "spec_checksum": "sha256:594d98df8733a0c816ed56395bb598ba96ea26981e6a01b06b8c82c8fd4ba71d",
-  "run_id": "20260617-015607",
+  "run_id": "20260908-054147",
   "category": "other",
   "description": "Credible, real-time US (and territories) disaster shelter information, unioning FEMA OpenShelters and the American Red Cross feed, for AI agents and people",
   "mcp_binary": "shelters-pp-mcp",
