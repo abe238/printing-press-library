@@ -62,3 +62,26 @@ func TestArcGISFetchReportsUnsupportedPaginationTruncation(t *testing.T) {
 		t.Fatalf("error = %v, want explicit truncation report", err)
 	}
 }
+
+// TestHiddenFetchFailsClosedOnServiceError covers the classification the
+// fail-closed path depends on: an ArcGIS response can be HTTP 200 and valid
+// JSON while carrying a service error or no features at all. Either shape must
+// reach the caller as an error, so the visibility check cannot silently read as
+// "no hidden shelters" and let a hidden site through.
+func TestHiddenFetchFailsClosedOnServiceError(t *testing.T) {
+	for name, body := range map[string]string{
+		"service error": `{"error":{"code":400,"message":"Unable to complete operation."}}`,
+		"no features":   `{"count":0}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			previous := getArcGISPage
+			t.Cleanup(func() { getArcGISPage = previous })
+			getArcGISPage = func(context.Context, string, string) ([]byte, error) {
+				return []byte(body), nil
+			}
+			if _, err := redCrossHiddenFetch(context.Background()); err == nil {
+				t.Fatal("redCrossHiddenFetch = nil error, want a failure so suppression fails closed")
+			}
+		})
+	}
+}
