@@ -8,6 +8,7 @@ package cli
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"sort"
@@ -21,16 +22,38 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// registerPrimaryCommands wires the three free-tier commands: search, dates,
-// and explore. These are added BEFORE the AeroAPI commands in root.go so they
-// appear at the top of --help, matching the user's stated priority of Google
-// Flights > Kayak > FlightAware.
+// registerPrimaryCommands wires the free-tier commands: search, dates,
+// explore, award (Seats.aero mileage — API key-gated), wifi (SeatWifi, no
+// key), and the multi-source fare commands. These are added BEFORE the
+// AeroAPI commands in root.go so they appear at the top of --help.
 func registerPrimaryCommands(rootCmd *cobra.Command, flags *rootFlags) {
 	rootCmd.AddCommand(newGfFlightsCmd(flags))
 	rootCmd.AddCommand(newGfDatesCmd(flags))
 	rootCmd.AddCommand(newSoarCmd(flags))
+	rootCmd.AddCommand(newAwardCmd(flags))
+	rootCmd.AddCommand(newWifiCmd(flags))
 	rootCmd.AddCommand(newKayakExploreCmd(flags))
 	rootCmd.AddCommand(newKayakLonghaulCmd(flags))
+}
+
+// classifyGoogleFlightsErr maps gflights backend errors to the CLI's
+// exit-code contract. Google's HTTP 429 becomes a rate-limit error (exit 7)
+// with an actionable hint; everything else passes through unchanged.
+// The generated classifyAPIError in helpers.go only serves the AeroAPI
+// commands, so every Google-backed command (flights, dates, batch,
+// transcend's fare probes) routes its errors through this mapping.
+// PATCH(amend-2026-07-31): see flights_batch.go for the dogfood origin.
+func classifyGoogleFlightsErr(err error) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, gflights.ErrRateLimited) {
+		return rateLimitErr(fmt.Errorf("%w\nhint: Google Flights rate-limits per IP and the block can persist for 15+ minutes."+
+			"\n      Wait before retrying — rapid retries extend the block."+
+			"\n      For bulk fare probes, run them in one paced invocation: flights --trip \"SEA>DEN@2026-09-14\" --trip \"PDX>DEN@2026-09-15\" --pace 3s"+
+			"\n      For a second price opinion right now, 'soar' (FlySoar) and 'explore'/'longhaul' (Kayak) use different backends and are not affected.", err))
+	}
+	return err
 }
 
 // ----- search: Google Flights one-shot search -----
@@ -38,7 +61,7 @@ func registerPrimaryCommands(rootCmd *cobra.Command, flags *rootFlags) {
 func newGfFlightsCmd(flags *rootFlags) *cobra.Command {
 	// PATCH(upstream cli-printing-press#804): expose currency only on Google
 	// Flights-backed price commands, not as a misleading root flag.
-	var returnDate, timeWindow, cabin, stops, sortBy, currencyCode string
+	var returnDate, timeWindow, returnTimeWindow, cabin, stops, sortBy, currencyCode string
 	var airlines []string
 	var passengers int
 	var excludeBasic bool
@@ -56,9 +79,46 @@ func newGfFlightsCmd(flags *rootFlags) *cobra.Command {
 	var segmentStrs []string
 	var provider string
 	var nonstop bool
+	// PATCH(amend-2026-07-31): batch fare probes with built-in pacing.
+	// See flights_batch.go for the dogfood origin.
+	var tripStrs []string
+	var pace time.Duration
+	// PATCH(library): true two-step round-trip flow. See
+	// gflights.SearchOptions.SelectOutbound.
+	var selectOutbound int
+
+	// buildSearchBase constructs the SearchOptions shared by every mode
+	// (single search, batch trips). One construction site so a future flag
+	// cannot reach one mode and silently miss the other (review finding).
+	buildSearchBase := func() gflights.SearchOptions {
+		base := gflights.SearchOptions{
+			TimeWindow:       timeWindow,
+			ReturnTimeWindow: returnTimeWindow,
+			Airlines:         airlines,
+			CabinClass:       cabin,
+			MaxStops:         stops,
+			SortBy:           sortBy,
+			Passengers:       passengers,
+			ExcludeBasic:     excludeBasic,
+			Currency:         currencyCode,
+			Emissions:        emissions,
+			LimitedResults:   limitedResults,
+		}
+		if checkedBags > 0 || carryOn {
+			base.Bags = &gflights.BagsFilter{CheckedBags: checkedBags, CarryOn: carryOn}
+		}
+		if len(layoverAirports) > 0 || maxLayoverMinutes > 0 {
+			base.Layover = &gflights.LayoverRestrictions{Airports: layoverAirports, MaxDuration: maxLayoverMinutes}
+		}
+		return base
+	}
 
 	cmd := &cobra.Command{
-		Use:         "flights <origin> <destination> <date>",
+		// PATCH(amend-2026-07-31): positionals are bracketed because two
+		// flag-driven modes replace them entirely: multi-city (>=2 --segment)
+		// and batch (--trip). The Args validator still requires exactly 3
+		// positionals for the plain single-search form.
+		Use:         "flights [origin destination date]",
 		Annotations: map[string]string{"mcp:read-only": "true"},
 		Short:       "Search Google Flights for a specific date (free, no API key required)",
 		Long: `flights is flight-goat's headline command. It queries Google Flights via
@@ -79,9 +139,61 @@ durations, airlines, and leg details. No API key. No auth. Just results.`,
   # Round trip with return date
   flight-goat-pp-cli flights SEA HNL 2026-08-01 --return 2026-08-10
 
+  # Round trip, morning outbound, evening return
+  flight-goat-pp-cli flights SEA HNL 2026-08-01 --return 2026-08-10 --time 6-12 --return-time 17-23
+
   # Multi-city (repeat --segment, positional args become optional)
-  flight-goat-pp-cli flights --segment "SFO>NRT@2026-08-15" --segment "NRT>ICN@2026-08-28" --segment "ICN>SFO@2026-09-05"`,
+  flight-goat-pp-cli flights --segment "SFO>NRT@2026-08-15" --segment "NRT>ICN@2026-08-28" --segment "ICN>SFO@2026-09-05"
+
+  # Batch of independent searches with built-in pacing (Google rate-limits
+  # bulk probes per IP — never fan these out in a shell loop)
+  flight-goat-pp-cli flights --trip "SEA>DEN@2026-09-14" --trip "PDX>DEN@2026-09-15@2026-09-17" --pace 3s --currency EUR
+
+  # True two-step round trip: --return alone shows outbound options, each
+  # priced with Google's own auto-picked "cheapest return" total but no
+  # return-leg detail. Run once to see the outbound list (--json for
+  # indices), then re-run with --select-outbound N to fetch the actual
+  # return options priced against that specific outbound.
+  flight-goat-pp-cli flights LHR BCN 2027-03-01 --return 2027-03-18 --json
+  flight-goat-pp-cli flights LHR BCN 2027-03-01 --return 2027-03-18 --select-outbound 1 --json`,
 		Args: func(cmd *cobra.Command, args []string) error {
+			// PATCH(library): --select-outbound only makes sense against a
+			// plain round-trip single search — reject the other modes before
+			// they run any network call.
+			if selectOutbound != 0 {
+				if selectOutbound < 1 {
+					return usageErr(fmt.Errorf("--select-outbound must be >= 1 (1-based index into the outbound itineraries a prior round-trip search returned)"))
+				}
+				if len(tripStrs) > 0 {
+					return usageErr(fmt.Errorf("--select-outbound does not apply to --trip batches; run the two-step flow per trip manually"))
+				}
+				if len(segmentStrs) >= 2 {
+					return usageErr(fmt.Errorf("--select-outbound does not apply to multi-city (--segment) searches"))
+				}
+				if returnDate == "" {
+					return usageErr(fmt.Errorf("--select-outbound requires --return (round trip only) — it fetches return-leg options for a specific outbound"))
+				}
+			}
+			// PATCH(amend-2026-07-31): batch mode (--trip) replaces the
+			// positional query entirely; mixing modes would be ambiguous.
+			// These conflict checks run BEFORE the multi-city early return —
+			// otherwise >=2 --segment would silently win over --trip
+			// (review finding: batch trips dropped without an error).
+			if len(tripStrs) > 0 {
+				if len(segmentStrs) > 0 {
+					return usageErr(fmt.Errorf("--trip (batch of independent searches) cannot be combined with --segment (one multi-city itinerary)"))
+				}
+				if len(args) > 0 {
+					return usageErr(fmt.Errorf("--trip replaces the positional <origin> <destination> <date>; drop the positional args or the --trip flags"))
+				}
+				if returnDate != "" {
+					return usageErr(fmt.Errorf("--return does not apply to --trip batches; encode the return per trip as ORIG>DEST@DEPART@RETURN"))
+				}
+				if pace < 0 {
+					return usageErr(fmt.Errorf("--pace must be >= 0 (got %s); pacing protects against Google's per-IP rate limit", pace))
+				}
+				return nil
+			}
 			// PATCH(library): multi-city mode (>=2 --segment values) makes
 			// the positional <origin> <destination> <date> optional and
 			// ignored. Single-segment positional invocation remains required
@@ -106,38 +218,102 @@ durations, airlines, and leg details. No API key. No auth. Just results.`,
 				return runMultiCity(cmd, flags, segments, provider, passengers, cabin, nonstop, currencyCode)
 			} else if len(segmentStrs) == 1 {
 				return fmt.Errorf("--segment requires >= 2 values for multi-city; got 1. Use the positional <origin> <destination> <date> form for a one-way search")
+			} else if len(tripStrs) > 0 {
+				// PATCH(amend-2026-07-31): batch mode — parse now so a bad
+				// trip fails before any network call, then hand off to the
+				// paced sequential runner in flights_batch.go.
+				trips, perr := parseBatchTrips(tripStrs)
+				if perr != nil {
+					// PATCH(review-2026-08-01): a malformed --trip is a usage
+					// error (exit 2), matching the conflict checks above.
+					return usageErr(perr)
+				}
+				base := buildSearchBase()
+				// PATCH(review-2026-08-01): validate the shared knobs once,
+				// before any network call — otherwise an invalid --currency
+				// or --stops fails identically on every trip with --pace
+				// sleeps in between, and exits 5 instead of 2.
+				if verr := gflights.ValidateSearchBase(base); verr != nil {
+					return usageErr(verr)
+				}
+				// PATCH(greptile review): ReturnTimeWindow is round-trip-only
+				// and ValidateSearchBase deliberately skips it (a batch of pure
+				// one-way trips must not reject a --return-time it will never
+				// read). But when the batch DOES contain a round-trip trip, a
+				// malformed --return-time should still fail here — before any
+				// network call — rather than mid-batch during segment
+				// construction, which would run earlier trips' requests first
+				// and surface the error as an API failure (exit 5) instead of
+				// a usage error (exit 2).
+				if base.ReturnTimeWindow != "" {
+					for _, t := range trips {
+						if t.ReturnDate == "" {
+							continue
+						}
+						if verr := gflights.ValidateTimeWindow(base.ReturnTimeWindow); verr != nil {
+							return usageErr(verr)
+						}
+						break
+					}
+				}
+				if flags.dryRun {
+					fmt.Fprintf(cmd.OutOrStdout(), "flights batch: %d trips, pace %s", len(trips), pace)
+					// PATCH(review-2026-08-01): mirror the single-search
+					// dry-run so shared filters are visible per batch too.
+					if base.Currency != "" {
+						fmt.Fprintf(cmd.OutOrStdout(), " currency=%s", strings.ToUpper(strings.TrimSpace(base.Currency)))
+					}
+					if base.MaxStops != "" {
+						fmt.Fprintf(cmd.OutOrStdout(), " stops=%s", strings.ToUpper(base.MaxStops))
+					}
+					if len(base.Airlines) > 0 {
+						fmt.Fprintf(cmd.OutOrStdout(), " airlines=%s", strings.Join(base.Airlines, ","))
+					}
+					fmt.Fprintln(cmd.OutOrStdout())
+					for _, t := range trips {
+						fmt.Fprintf(cmd.OutOrStdout(), "  gflights.Search(%s -> %s on %s", t.Origin, t.Destination, t.DepartureDate)
+						if t.ReturnDate != "" {
+							fmt.Fprintf(cmd.OutOrStdout(), " return=%s", t.ReturnDate)
+						}
+						fmt.Fprintln(cmd.OutOrStdout(), ")")
+					}
+					fmt.Fprintln(cmd.OutOrStdout(), "(dry run - no request sent)")
+					return nil
+				}
+				return runFlightsBatch(cmd, flags, trips, base, pace)
 			} else {
 				origin = strings.ToUpper(args[0])
 				destination = strings.ToUpper(args[1])
 				departureDate = args[2]
 			}
-			opts := gflights.SearchOptions{
-				Origin:         origin,
-				Destination:    destination,
-				DepartureDate:  departureDate,
-				ReturnDate:     returnDate,
-				TimeWindow:     timeWindow,
-				Airlines:       airlines,
-				CabinClass:     cabin,
-				MaxStops:       stops,
-				SortBy:         sortBy,
-				Passengers:     passengers,
-				ExcludeBasic:   excludeBasic,
-				Currency:       currencyCode,
-				Emissions:      emissions,
-				LimitedResults: limitedResults,
-				Segments:       segments,
-			}
-			if checkedBags > 0 || carryOn {
-				opts.Bags = &gflights.BagsFilter{CheckedBags: checkedBags, CarryOn: carryOn}
-			}
-			if len(layoverAirports) > 0 || maxLayoverMinutes > 0 {
-				opts.Layover = &gflights.LayoverRestrictions{Airports: layoverAirports, MaxDuration: maxLayoverMinutes}
+			opts := buildSearchBase()
+			opts.Origin = origin
+			opts.Destination = destination
+			opts.DepartureDate = departureDate
+			opts.ReturnDate = returnDate
+			opts.Segments = segments
+			opts.SelectOutbound = selectOutbound
+			// PATCH(greptile review): mirror the batch path's --return-time
+			// preflight for the single-search form — otherwise a malformed
+			// value reports success on --dry-run and a generic error (not a
+			// usage error) on a real run, only surfacing deep in segment
+			// construction. Only applies when the search is actually a round
+			// trip; --return-time is documented as ignored otherwise.
+			if opts.ReturnDate != "" && opts.ReturnTimeWindow != "" {
+				if verr := gflights.ValidateTimeWindow(opts.ReturnTimeWindow); verr != nil {
+					return usageErr(verr)
+				}
 			}
 			if flags.dryRun {
 				fmt.Fprintf(cmd.OutOrStdout(), "gflights.Search(%s -> %s on %s)", opts.Origin, opts.Destination, opts.DepartureDate)
 				if opts.ReturnDate != "" {
 					fmt.Fprintf(cmd.OutOrStdout(), " return=%s", opts.ReturnDate)
+				}
+				if opts.ReturnTimeWindow != "" {
+					fmt.Fprintf(cmd.OutOrStdout(), " return-time=%s", opts.ReturnTimeWindow)
+				}
+				if opts.SelectOutbound > 0 {
+					fmt.Fprintf(cmd.OutOrStdout(), " select-outbound=%d", opts.SelectOutbound)
 				}
 				if opts.MaxStops != "" {
 					fmt.Fprintf(cmd.OutOrStdout(), " stops=%s", strings.ToUpper(opts.MaxStops))
@@ -155,7 +331,9 @@ durations, airlines, and leg details. No API key. No auth. Just results.`,
 			ctx := context.Background()
 			result, err := gflights.Search(ctx, opts)
 			if err != nil {
-				return err
+				// PATCH(amend-2026-07-31): map Google 429s to the CLI's
+				// rate-limit exit code + pacing hint (see flights_batch.go).
+				return classifyGoogleFlightsErr(err)
 			}
 
 			if flags.asJSON || !isTerminal(cmd.OutOrStdout()) {
@@ -164,8 +342,24 @@ durations, airlines, and leg details. No API key. No auth. Just results.`,
 				return nil
 			}
 
-			fmt.Fprintf(cmd.ErrOrStderr(), "%d flights found for %s -> %s on %s (source: %s)\n",
-				result.Count, opts.Origin, opts.Destination, opts.DepartureDate, result.Source)
+			// PATCH(library): --select-outbound's response is return-leg-only
+			// (result.Flights holds Direction=="return" rows against the
+			// destination->origin route on ReturnDate) — label it as such
+			// instead of the default header, which would otherwise claim
+			// these are outbound results for the wrong route/date.
+			if result.SelectedOutbound != nil {
+				ob := result.SelectedOutbound
+				obDepart, carrier := "", ""
+				if len(ob.Legs) > 0 {
+					obDepart = trimTime(ob.Legs[0].DepartureTime)
+					carrier = ob.Legs[0].Airline.Code + ob.Legs[0].FlightNumber
+				}
+				fmt.Fprintf(cmd.ErrOrStderr(), "%d return options for %s -> %s on %s, paired with outbound %s (%s, departs %s) (source: %s)\n",
+					result.Count, opts.Destination, opts.Origin, opts.ReturnDate, carrier, formatPrice(ob.Currency, ob.Price), obDepart, result.Source)
+			} else {
+				fmt.Fprintf(cmd.ErrOrStderr(), "%d flights found for %s -> %s on %s (source: %s)\n",
+					result.Count, opts.Origin, opts.Destination, opts.DepartureDate, result.Source)
+			}
 
 			tw := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 0, 2, ' ', 0)
 			fmt.Fprintln(tw, "PRICE\tDURATION\tSTOPS\tAIRLINES\tDEPART\tARRIVE")
@@ -199,7 +393,8 @@ durations, airlines, and leg details. No API key. No auth. Just results.`,
 		},
 	}
 	cmd.Flags().StringVarP(&returnDate, "return", "r", "", "Return date for round-trip (YYYY-MM-DD)")
-	cmd.Flags().StringVarP(&timeWindow, "time", "t", "", "Departure time window in 24h format (e.g. 6-20 for 6am-8pm)")
+	cmd.Flags().StringVarP(&timeWindow, "time", "t", "", "Departure time window in 24h format (e.g. 6-20 for 6am-8pm). Applies to both legs of a round trip unless --return-time overrides the return leg.")
+	cmd.Flags().StringVar(&returnTimeWindow, "return-time", "", "Return leg departure time window in 24h format (e.g. 14-22), independent of --time. Round trip only; ignored for one-way and multi-city.")
 	cmd.Flags().StringSliceVarP(&airlines, "airlines", "a", nil, "Airline IATA codes (e.g. BA,KL,DL)")
 	cmd.Flags().StringVarP(&cabin, "class", "c", "", "Cabin class: economy, premium_economy, business, first")
 	cmd.Flags().StringVarP(&stops, "stops", "s", "", "Max stops: any, non_stop, one_stop, two_plus_stops")
@@ -218,6 +413,9 @@ durations, airlines, and leg details. No API key. No auth. Just results.`,
 	cmd.Flags().StringSliceVar(&segmentStrs, "segment", nil, "Multi-city: repeatable segment in 'ORIG>DEST@YYYY-MM-DD' form. Pass >=2 to trigger multi-city search; positional args become optional and ignored.")
 	cmd.Flags().StringVar(&provider, "provider", "auto", "Multi-city provider: 'auto' (Kayak for prices + Google URL fallback, default), 'kayak' (prices only), or 'google' (URL only — opens authenticated multi-city search in browser).")
 	cmd.Flags().BoolVar(&nonstop, "nonstop", false, "Multi-city only: restrict to nonstop flights on every leg. Equivalent to /nonstop on Kayak.")
+	cmd.Flags().StringSliceVar(&tripStrs, "trip", nil, "Batch: repeatable independent search in 'ORIG>DEST@YYYY-MM-DD' or 'ORIG>DEST@DEPART@RETURN' form. Trips run sequentially with --pace between them; positional args must be omitted.")
+	cmd.Flags().DurationVar(&pace, "pace", 2*time.Second, "Batch only: delay between consecutive --trip searches (Google rate-limits bulk probes per IP)")
+	cmd.Flags().IntVar(&selectOutbound, "select-outbound", 0, "Round trip only: 1-based index (in outbound order from a prior plain --return search) of the outbound itinerary to select, then fetch real return-leg options priced against it. Without this flag, --return alone shows outbound-only results, each carrying Google's own auto-picked cheapest-return total with no return-leg detail.")
 	return cmd
 }
 
@@ -244,7 +442,7 @@ func runMultiCity(cmd *cobra.Command, flags *rootFlags, segments []gflights.Segm
 	if provider == "auto" || provider == "google" {
 		mcsegs := make([]gflights.Segment, len(segments))
 		copy(mcsegs, segments)
-		u, err := gflights.MultiCityBookingURL(mcsegs)
+		u, err := gflights.MultiCityBookingURL(mcsegs, currencyCode)
 		if err != nil {
 			return fmt.Errorf("multi-city: google url: %w", err)
 		}
@@ -478,7 +676,8 @@ a range of dates. No API key required. Uses flight-goat's native Go backend
 			ctx := context.Background()
 			result, err := gflights.Dates(ctx, opts)
 			if err != nil {
-				return err
+				// PATCH(amend-2026-07-31): see classifyGoogleFlightsErr.
+				return classifyGoogleFlightsErr(err)
 			}
 
 			dates := result.Dates

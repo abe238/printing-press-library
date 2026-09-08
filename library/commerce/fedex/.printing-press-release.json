@@ -2,17 +2,17 @@
   "schema_version": 1,
   "slug": "fedex",
   "cli_name": "fedex-pp-cli",
-  "version": "2026.7.1",
-  "released_at": "2026-07-08T18:21:21Z",
-  "source_commit": "11d7b4ea752c9c8fb8909037133058eb57560cc0",
+  "version": "2026.9.1",
+  "released_at": "2026-09-03T09:06:45Z",
+  "source_commit": "ef540232d9e7b16b51fb397fdc215eb6995d7e35",
   "printing_press_version": "3.6.0",
   "run_id": "20260502-152509",
   "changes": [
     {
-      "title": "fix(catalog): require Go 1.26.5 across published modules",
-      "pr": 1467,
-      "url": "https://github.com/mvanhorn/printing-press-library/pull/1467",
-      "commit": "11d7b4ea752c9c8fb8909037133058eb57560cc0"
+      "title": "fix(fedex): prevent unsafe mutation retries",
+      "pr": 1910,
+      "url": "https://github.com/mvanhorn/printing-press-library/pull/1910",
+      "commit": "ef540232d9e7b16b51fb397fdc215eb6995d7e35"
     }
   ]
 }

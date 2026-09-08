@@ -15,6 +15,7 @@ import (
 
 	mcplib "github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
+	"github.com/mvanhorn/printing-press-library/library/food-and-dining/anylist/internal/mcp/cobratree"
 )
 
 // RegisterCodeOrchestrationTools registers the two agent-facing tools that
@@ -23,7 +24,7 @@ import (
 func RegisterCodeOrchestrationTools(s *server.MCPServer) {
 	s.AddTool(
 		mcplib.NewTool("anylist_search",
-			mcplib.WithDescription("Find anylist endpoints. Returns {endpoint_id, method, path, summary}. Call first."),
+			mcplib.WithDescription("Find read-only anylist endpoints. Returns {endpoint_id, method, path, summary}. Mutation endpoints are intentionally excluded — use the anylist-pp-cli command mirror for writes. Call first."),
 			mcplib.WithString("query", mcplib.Required(), mcplib.Description("Keywords.")),
 			mcplib.WithNumber("limit", mcplib.Description("Max results.")),
 		),
@@ -32,7 +33,7 @@ func RegisterCodeOrchestrationTools(s *server.MCPServer) {
 
 	s.AddTool(
 		mcplib.NewTool("anylist_execute",
-			mcplib.WithDescription("Execute anylist endpoint by endpoint_id from anylist_search. Pass params as JSON."),
+			mcplib.WithDescription("Execute a read-only anylist endpoint by endpoint_id from anylist_search. Pass params as JSON. Fails closed before any request for mutation or unclassified endpoints; perform writes through the anylist-pp-cli command mirror, which owns preview/apply, read-after-write verification, and cache synchronization."),
 			mcplib.WithString("endpoint_id", mcplib.Required(), mcplib.Description("Endpoint ID from anylist_search.")),
 			mcplib.WithObject("params", mcplib.Description("Endpoint params.")),
 		),
@@ -54,8 +55,90 @@ type codeOrchEndpoint struct {
 	keywords   []string
 }
 
-// codeOrchEndpoints is populated by init() in code_orch_data.go.
+// codeOrchEndpoints is populated by the domain-specific registry files.
 var codeOrchEndpoints []codeOrchEndpoint
+
+// codeOrchReadOnlyEndpoints is the explicit fail-closed allowlist for the
+// generic execute tool. Only these endpoints may be searched and executed:
+// GET lookups, explicit local-cache reads, and POST data-fetches against the
+// read-only /data/user-data/get route are allowed. Everything else — every
+// */update, share, photo, and link route — is a mutation that must go through
+// the CLI command mirror, where preview/apply, typed payloads, read-after-write
+// verification, and cache sync are enforced.
+// An endpoint is executable only if it is listed here; regeneration that adds
+// new read endpoints must consciously extend this set (code_orch_test.go
+// keeps the list in lockstep with endpoint shapes).
+var codeOrchReadOnlyEndpoints = map[string]bool{
+	"categories.list":      true,
+	"collections.list":     true,
+	"export":               true,
+	"favorites.list":       true,
+	"folders.list":         true,
+	"items.list":           true,
+	"items.lookup":         true,
+	"items.recent":         true,
+	"items.search":         true,
+	"lists.by-store":       true,
+	"lists.list":           true,
+	"meal.labels":          true,
+	"meal.show":            true,
+	"meal.summary":         true,
+	"recipes.filter":       true,
+	"recipes.ingredients":  true,
+	"recipes.list":         true,
+	"recipes.missing":      true,
+	"recipes.scale":        true,
+	"recipes.search":       true,
+	"recipes.show":         true,
+	"recipes.duplicates":   true,
+	"recipes.sharing.list": true,
+	"starters.list":        true,
+	"stores.list":          true,
+}
+
+// codeOrchLocalReadOnlyEndpoints are local commands that generic
+// orchestration may discover and execute through the companion CLI. They are
+// kept separate from remote API reads so the local-cache sentinel can never
+// be mistaken for an HTTP path.
+var codeOrchLocalReadOnlyEndpoints = map[string]bool{
+	"recipes.duplicates": true,
+}
+
+// codeOrchReadOnlyGate fails closed for any endpoint that generic execution
+// must not touch. It runs before the client is constructed, so a rejected
+// request never reaches config loading or the network.
+func codeOrchReadOnlyGate(ep *codeOrchEndpoint) error {
+	if !codeOrchReadOnlyEndpoints[ep.ID] {
+		return fmt.Errorf(
+			"endpoint %q is a mutation or unclassified endpoint; anylist_execute is read-only and fails closed before sending any request. Use the anylist-pp-cli command mirror for writes — it enforces preview/apply, read-after-write verification, and cache synchronization",
+			ep.ID)
+	}
+	// Defense in depth: even a listed endpoint must be structurally a read —
+	// an explicit local-cache command, a GET, or a POST aimed exactly at the
+	// read-only user-data fetch route.
+	if codeOrchLocalReadOnlyEndpoints[ep.ID] {
+		if ep.Method != "GET" || ep.Path != "local-cache" {
+			return fmt.Errorf(
+				"endpoint %q is classified as a local read but has metadata %s %s; refusing to execute",
+				ep.ID, ep.Method, ep.Path)
+		}
+		return nil
+	}
+	switch ep.Method {
+	case "GET":
+	case "POST":
+		if ep.Path != "/data/user-data/get" {
+			return fmt.Errorf(
+				"endpoint %q is classified read-only but targets %s %s; refusing to execute — use the anylist-pp-cli command mirror",
+				ep.ID, ep.Method, ep.Path)
+		}
+	default:
+		return fmt.Errorf(
+			"endpoint %q uses method %q, which anylist_execute cannot execute; use the anylist-pp-cli command mirror",
+			ep.ID, ep.Method)
+	}
+	return nil
+}
 
 func handleCodeOrchSearch(ctx context.Context, req mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {
 	args := req.GetArguments()
@@ -76,6 +159,11 @@ func handleCodeOrchSearch(ctx context.Context, req mcplib.CallToolRequest) (*mcp
 	results := make([]scored, 0, len(codeOrchEndpoints))
 	for i := range codeOrchEndpoints {
 		ep := &codeOrchEndpoints[i]
+		// Search only advertises routes generic execution can safely
+		// perform; mutation endpoints are hidden, not merely scored lower.
+		if !codeOrchReadOnlyEndpoints[ep.ID] {
+			continue
+		}
 		score := 0
 		for _, t := range terms {
 			for _, kw := range ep.keywords {
@@ -130,6 +218,19 @@ func handleCodeOrchExecute(ctx context.Context, req mcplib.CallToolRequest) (*mc
 	params, _ := args["params"].(map[string]any)
 	if params == nil {
 		params = map[string]any{}
+	}
+
+	// Fail closed before constructing the client: no mutation or
+	// unclassified route may reach the network via generic execution.
+	if err := codeOrchReadOnlyGate(ep); err != nil {
+		return mcplib.NewToolResultError(err.Error()), nil
+	}
+
+	if codeOrchLocalReadOnlyEndpoints[ep.ID] {
+		localReq := req
+		localReq.Params.Arguments = params
+		commandPath := strings.Split(ep.ID, ".")
+		return cobratree.ShellOutToCLI(cobratree.SiblingCLIPath, commandPath)(ctx, localReq)
 	}
 
 	c, err := newMCPClient()

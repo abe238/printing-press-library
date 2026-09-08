@@ -6,6 +6,8 @@ Powered by Open-Meteo (global forecasts, 80 years of history, air quality) and N
 
 Created by [@tmchow](https://github.com/tmchow) (Trevin Chow).
 
+Contributors: [@KalebCole](https://github.com/KalebCole) (Kaleb Cole).
+
 ## Install
 
 The recommended path installs both the `weather-goat-pp-cli` binary and the `pp-weather-goat` agent skill (Claude Code, Codex, Cursor, Gemini CLI, GitHub Copilot, and other agents supported by the upstream [`skills`](https://github.com/vercel-labs/skills) CLI) in one shot:
@@ -35,7 +37,7 @@ npx -y @mvanhorn/printing-press-library install weather-goat --agent claude-code
 
 ### Without Node (Go fallback)
 
-If `npx` isn't available (no Node, offline), install the CLI directly via Go (requires Go 1.26.5 or newer):
+If `npx` isn't available (no Node, offline), install the CLI directly via Go (requires Go 1.26.6 or newer):
 
 ```bash
 go install github.com/mvanhorn/printing-press-library/library/other/weather-goat/cmd/weather-goat-pp-cli@latest

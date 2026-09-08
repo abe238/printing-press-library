@@ -46,7 +46,7 @@ Our AeroAPI push notification [testing interface](/commercial/aeroapi/send.rvt)
 provides a quick and easy way to test the delivery of customized alerts via AeroAPI push.
 
 Created by [@mvanhorn](https://github.com/mvanhorn) (Matt Van Horn).
-Contributors: [@lloydarmbrust](https://github.com/lloydarmbrust) (Lloyd Armbrust), [@tmchow](https://github.com/tmchow) (Trevin Chow), [@omarshahine](https://github.com/omarshahine) (Omar Shahine).
+Contributors: [@lloydarmbrust](https://github.com/lloydarmbrust) (Lloyd Armbrust), [@tmchow](https://github.com/tmchow) (Trevin Chow), [@omarshahine](https://github.com/omarshahine) (Omar Shahine), [@giuseppebisemi](https://github.com/giuseppebisemi) (Giuseppe Bisemi).
 
 ## Install
 
@@ -77,7 +77,7 @@ npx -y @mvanhorn/printing-press-library install flight-goat --agent claude-code 
 
 ### Without Node (Go fallback)
 
-If `npx` isn't available (no Node, offline), install the CLI directly via Go (requires Go 1.26.5 or newer):
+If `npx` isn't available (no Node, offline), install the CLI directly via Go (requires Go 1.26.6 or newer):
 
 ```bash
 go install github.com/mvanhorn/printing-press-library/library/travel/flight-goat/cmd/flight-goat-pp-cli@latest
@@ -183,6 +183,14 @@ Get your API key from your API provider's developer portal. The key typically lo
 export FLIGHT_GOAT_API_KEY="<paste-your-key>"
 ```
 
+The `award` command uses a separate Seats.aero Partner API key, not `FLIGHT_GOAT_API_KEY`:
+
+```bash
+export SEATS_AERO_API_KEY="<your-seats-aero-pro-key>"
+```
+
+Seats.aero Pro users can generate one under their Settings → API tab; cached search (the endpoint `award` uses) is Pro-eligible, while live search requires a commercial agreement and is intentionally not exposed.
+
 To persist credentials, use `flight-goat-pp-cli auth set-token <token>`. Stored secrets live in `credentials.toml` under the data directory, not in `config.toml`.
 
 ### 3. Verify Setup
@@ -253,6 +261,44 @@ Relocation is one-way. Unsetting `FLIGHT_GOAT_HOME` does not move files back to 
 Existing installs keep working because the platform-default rung matches the legacy layout. On the first auth write, stored secrets leave `config.toml` and are consolidated into `credentials.toml` under the data directory. Run `flight-goat-pp-cli doctor --fail-on warn` to check path and credential-location warnings in automation.
 
 ## Commands
+
+### Fare search (no API key)
+
+The headline commands query consumer fare sources directly — no `FLIGHT_GOAT_API_KEY` needed. FlightAware AeroAPI (the resources below) is secondary and optional.
+
+- **`flight-goat-pp-cli flights <origin> <destination> <date>`** - Google Flights fare search with real prices, durations, airlines, and leg details. Round trip with `--return`, multi-city with repeated `--segment`, batch probes with repeated `--trip`. Departure time window with `--time` (outbound) and `--return-time` (return leg, independent of `--time`; falls back to it when unset). `--select-outbound N` fetches real return-leg options priced against a specific outbound instead of Google's default bundled total — see below.
+- **`flight-goat-pp-cli dates <origin> <destination>`** - Cheapest-date scan for a route across a travel window. One-way by default; `--round --duration N` scans round-trip totals instead — see below.
+- **`flight-goat-pp-cli explore <airport>`** / **`flight-goat-pp-cli longhaul <airport>`** - Kayak nonstop and long-haul route discovery.
+- **`flight-goat-pp-cli soar <origin> <destination> <date>`** - FlySoar (Duffel NDC/GDS) second price opinion with a booking handoff.
+- **`flight-goat-pp-cli award <origin> <destination> [--from YYYY-MM-DD --to YYYY-MM-DD]`** - Seats.aero award (mileage) availability across cabin classes (economy/premium/business/first). Requires `SEATS_AERO_API_KEY` (Seats.aero Partner API key; cached search is Pro-eligible). Read-only — miles + taxes, no booking deeplinks.
+- **`flight-goat-pp-cli wifi flight <flightNumber>`** / **`wifi airline <IATA>`** / **`wifi airlines`** / **`wifi rollouts [IATA]`** / **`wifi speed <flight>`** / **`wifi airline-speed <IATA>`** / **`wifi search <query>`** - SeatWifi in-flight WiFi predictions, Starlink rollout status, and crowdsourced speed reports. No API key. Read-only.
+- **`flight-goat-pp-cli assess`** - Delayed-flight/rebooking decision support.
+
+Booking deeplinks in each result's `booking_urls` quote the same `--currency` the search ran in. `award` is the exception: it quotes mileage/points rather than cash and does not produce booking deeplinks.
+
+#### Round trip: getting real return-leg options with `--select-outbound`
+
+`--return` alone returns **outbound itineraries only**. Each row's price already bundles Google's own auto-picked "cheapest return" total, but no actual return flight (time, airline, duration) is shown. To see and choose real return-leg options — the same two-step flow Google's own site uses — run the search twice: first `flight-goat-pp-cli flights LHR BCN 2027-03-01 --return 2027-03-18` for the outbound list, then `flight-goat-pp-cli flights LHR BCN 2027-03-01 --return 2027-03-18 --select-outbound 1` to fetch return options priced against the 1st outbound in that list.
+
+`--select-outbound N` is a 1-based index into the outbound list step 1 returned. It requires `--return` and cannot combine with `--trip` or `--segment`. JSON output (`--json`/`--agent`) adds `direction` (`outbound`/`return`) on each flight and `selected_outbound` on the envelope, so a script or agent can tell which itinerary a set of return options is paired against.
+
+#### Round trip cheapest dates: `dates --round --duration`
+
+`dates` scans one-way prices by default. `--round --duration N` scans round-trip totals instead: `flight-goat-pp-cli dates SEA HNL --round --duration 7 --sort --agent` returns, for each candidate departure day, the cheapest combined round-trip price for departing that day and returning `N` nights later — not a separate outbound/return price pair. `--duration` is required with `--round` (nights, must be greater than zero). Each result row's `price` is already the round-trip total, and `return_date` (`departure_date` + `--duration`) is included alongside it.
+
+#### Bulk fare probes with built-in pacing
+
+Google rate-limits fare traffic per IP; parallel shell loops over `flights` trigger HTTP 429 blocks that can outlast 15 minutes. Run bulk probes in one paced invocation:
+
+```bash
+flight-goat-pp-cli flights \
+  --trip "SEA>DEN@2026-09-14" \
+  --trip "PDX>DEN@2026-09-15@2026-09-17" \
+  --trip "SFO>DEN@2026-09-15" \
+  --pace 3s --currency EUR --agent
+```
+
+`--trip` takes `ORIG>DEST@DEPART` or `ORIG>DEST@DEPART@RETURN` and replaces the positional args; every filter flag applies to all trips. The single JSON envelope carries per-trip rows (`status` `ok`/`error`/`skipped`). Transient 429s retry automatically (2s/5s/12s backoff); on a persistent 429 the batch stops early, the partial envelope is still emitted, and the exit code is 7 (rate limited). `soar` and `explore` use different backends and keep working while Google is blocked.
 
 ### aircraft
 

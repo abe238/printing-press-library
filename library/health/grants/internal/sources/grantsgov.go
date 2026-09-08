@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"html"
+	"strings"
+	"time"
 )
 
 // Grants.gov Search2 API — open federal funding opportunities.
@@ -13,6 +15,59 @@ const (
 	grantsSearchURL = "https://api.grants.gov/v1/api/search2"
 	grantsFetchURL  = "https://api.grants.gov/v1/api/fetchOpportunity"
 )
+
+// grantsSortNewestFirst orders results by posting date, newest first.
+//
+// "posted" means the record was published and never closed, not that the
+// opportunity is still accepting applications. Grants.gov leaves stale records
+// in that state indefinitely: measured on 2026-08-11 for the keyword
+// "climate", the 66 posted results included a NOAA call opened in July 2011
+// for fiscal year 2012, and 8 of the 66 predated 2022. Unsorted, those records
+// surface on the first page ahead of live ones.
+//
+// Sorting rather than filtering is deliberate. A date filter would discard
+// them: the API's dateRange parameter cuts the same 66 results to 27 at one
+// year and to 7 at 30 days, and some genuinely rolling programs opened years
+// ago and still accept applications. Sorting keeps every result reachable
+// while putting the live ones first — measured, the top ten then all opened
+// within the current year and all carried real deadlines.
+//
+// Verified to take effect rather than being silently ignored: "openDate|asc"
+// returns the 2011 record first, "openDate|desc" returns one opened the
+// previous day. By contrast openDateFrom is accepted and has no effect (the
+// hit count is unchanged), so it must not be used.
+const grantsSortNewestFirst = "openDate|desc"
+
+// grantsStaleAfter is how old a posting may be before it is worth flagging.
+//
+// Two years is past every annual funding cycle, so a still-posted record older
+// than that is more likely forgotten than rolling. This drives a caveat in the
+// output, never a filter.
+const grantsStaleAfter = 2 * 365 * 24 * time.Hour
+
+// grantsDateLayout is the MM/DD/YYYY format the API returns.
+const grantsDateLayout = "01/02/2006"
+
+// normalizeText collapses interior whitespace runs to a single space and trims
+// the ends.
+//
+// Grants.gov ships raw agency-entered text. Measured on 2026-09-03 for the
+// keyword "climate" (48 results): three titles carried doubled interior
+// spaces — "Egypt  Annual Program Statement" (DFOP0018819), "Science &
+// Technology  Broad Agency Announcement" (HM047623BAA0001) and "Notice of
+// Intent:  Program to End Modern Slavery" (SFOP0008547) — and two agency
+// names carried a trailing space: "National Geospatial-Intelligence Agency "
+// (HM047623BAA0001) and "DOT Federal Highway Administration "
+// (693JJ323NF00014).
+//
+// strings.Fields rather than a regexp, for two reasons. This module has no
+// external dependencies and stdlib keeps it that way; and Fields splits on
+// unicode.IsSpace, so it also folds the non-breaking space that
+// html.UnescapeString produces from &nbsp;. Go's regexp \s class is ASCII-only
+// and would leave U+00A0 in place.
+func normalizeText(s string) string {
+	return strings.Join(strings.Fields(s), " ")
+}
 
 type Opportunity struct {
 	ID         json.Number `json:"id"`
@@ -26,6 +81,34 @@ type Opportunity struct {
 
 	// Populated from fetchOpportunity, only for --details/--min-award/--eligibility.
 	Details *OppDetails `json:"details,omitempty"`
+}
+
+// Stale reports whether this opportunity was posted long enough ago that its
+// "posted" status is questionable. Unparseable or missing dates are not
+// treated as stale: absence of evidence is not evidence.
+func (o Opportunity) Stale() bool {
+	t, err := time.Parse(grantsDateLayout, o.OpenDate)
+	if err != nil {
+		return false
+	}
+	return time.Since(t) > grantsStaleAfter
+}
+
+// HasDeadline reports whether the record carries a real closing date.
+//
+// Two shapes mean "none stated": an empty string (19 of 66 measured results)
+// and the placeholder 01/01/2099 (2 of 66). Neither confirms that applications
+// are still accepted — the 2011 record has an empty close date — so callers
+// should describe these as unstated rather than as rolling.
+func (o Opportunity) HasDeadline() bool {
+	if o.CloseDate == "" {
+		return false
+	}
+	t, err := time.Parse(grantsDateLayout, o.CloseDate)
+	if err != nil {
+		return false
+	}
+	return t.Year() < 2099
 }
 
 type OppDetails struct {
@@ -54,13 +137,15 @@ type grantsSearchResp struct {
 	} `json:"data"`
 }
 
-// SearchOpportunities lists posted (open) opportunities matching keyword.
+// SearchOpportunities lists posted (open) opportunities matching keyword,
+// newest posting first.
 func SearchOpportunities(keyword, agencyCode string, rows int) ([]Opportunity, int, error) {
 	payload := map[string]any{
 		"keyword":        keyword,
 		"oppStatuses":    "posted",
 		"rows":           rows,
 		"startRecordNum": 0,
+		"sortBy":         grantsSortNewestFirst,
 	}
 	if agencyCode != "" {
 		payload["agencies"] = agencyCode
@@ -74,9 +159,25 @@ func SearchOpportunities(keyword, agencyCode string, rows int) ([]Opportunity, i
 	}
 	opps := resp.Data.OppHits
 	for i := range opps {
-		opps[i].Title = html.UnescapeString(opps[i].Title) // titles contain entities such as &ndash;
+		// Unescape first, normalize second. The order matters: unescaping can
+		// itself produce whitespace (&nbsp; becomes U+00A0, &#32; a plain
+		// space), so normalizing first would leave that behind.
+		opps[i].Title = normalizeText(html.UnescapeString(opps[i].Title)) // titles contain entities such as &ndash;
+		opps[i].Agency = normalizeText(html.UnescapeString(opps[i].Agency))
 	}
 	return opps, resp.Data.HitCount, nil
+}
+
+// CountStale returns how many of these opportunities were posted long enough
+// ago to be worth a caveat.
+func CountStale(opps []Opportunity) int {
+	n := 0
+	for _, o := range opps {
+		if o.Stale() {
+			n++
+		}
+	}
+	return n
 }
 
 type grantsFetchResp struct {

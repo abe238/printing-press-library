@@ -1,6 +1,6 @@
 ---
 name: pp-flight-goat
-description: "Printing Press CLI for Flight Goat. AeroAPI is a simple, query-based API that gives software developers access to a variety of FlightAware's flight data."
+description: "Printing Press CLI for Flight Goat. Search real Google Flights fares, cheapest dates, Kayak routes, and FlySoar price checks with no API key — plus optional FlightAware AeroAPI flight status, delay, and alert data."
 author: "Matt Van Horn"
 license: "Apache-2.0"
 argument-hint: "<command> [args] | install cli|mcp"
@@ -29,13 +29,62 @@ This skill drives the `flight-goat-pp-cli` binary. **You must verify the CLI is 
 2. Verify: `flight-goat-pp-cli --version`
 3. Ensure the reported install directory is on `$PATH` for the agent/runtime that will invoke this skill.
 
-If the `npx` install fails (no Node, offline, etc.), fall back to a direct Go install (requires Go 1.26.5 or newer). This installs into `$GOPATH/bin` (default `$HOME/go/bin`), so add that directory to `$PATH` instead:
+If the `npx` install fails (no Node, offline, etc.), fall back to a direct Go install (requires Go 1.26.6 or newer). This installs into `$GOPATH/bin` (default `$HOME/go/bin`), so add that directory to `$PATH` instead:
 
 ```bash
 go install github.com/mvanhorn/printing-press-library/library/travel/flight-goat/cmd/flight-goat-pp-cli@latest
 ```
 
 If `--version` reports "command not found" after install, the runtime cannot see the binary directory on `$PATH`. Do not proceed with skill commands until verification succeeds.
+
+## Unique Capabilities: fare search without an API key
+
+The headline commands hit consumer fare sources directly and need no credentials — do not present the CLI as AeroAPI-gated. FlightAware AeroAPI (documented below) is secondary and optional.
+
+- `flight-goat-pp-cli flights <origin> <destination> <date>` — Google Flights fare search: real prices, legs, airlines. Round trip with `--return`, multi-city with repeated `--segment`, batch probes with repeated `--trip`.
+- `flight-goat-pp-cli dates <origin> <destination>` — cheapest-date scan across a travel window.
+- `flight-goat-pp-cli explore <airport>` / `flight-goat-pp-cli longhaul <airport>` — Kayak nonstop and long-haul route discovery.
+- `flight-goat-pp-cli soar <origin> <destination> <date>` — FlySoar (Duffel NDC/GDS) second price opinion with booking handoff.
+- `flight-goat-pp-cli award <origin> <destination>` — Seats.aero award (mileage) availability: miles + taxes redemption options across cabins. **Requires** `SEATS_AERO_API_KEY` (a Seats.aero Partner API key; cached search is Pro-eligible). Read-only.
+- `flight-goat-pp-cli wifi flight <flightNumber>` / `wifi airline <IATA>` / `wifi airlines` / `wifi rollouts [IATA]` / `wifi speed <flight>` / `wifi airline-speed <IATA>` / `wifi search <query>` — SeatWifi in-flight WiFi predictions, Starlink rollout status, and crowdsourced speed reports. **No API key.** Public JSON at https://seatwifi.com. Read-only.
+- `flight-goat-pp-cli assess` — delayed-flight/rebooking decision support.
+
+Booking deeplinks in each result's `booking_urls` quote the same `--currency` the search ran in. `award` is the exception: it quotes mileage/points, not cash, and does not produce booking deeplinks.
+
+### Bulk fare probes: use --trip with --pace, never a shell loop
+
+Google rate-limits fare traffic per IP. Parallel shell loops over `flights` invocations trigger HTTP 429 blocks that can outlast 15 minutes. Run bulk probes in one paced invocation instead:
+
+```bash
+# Three independent searches, 3s apart, one JSON envelope with per-trip rows
+flight-goat-pp-cli flights \
+  --trip "SEA>DEN@2026-09-14" \
+  --trip "PDX>DEN@2026-09-15@2026-09-17" \
+  --trip "SFO>DEN@2026-09-15" \
+  --pace 3s --currency EUR --agent
+```
+
+`--trip` takes `ORIG>DEST@DEPART` or `ORIG>DEST@DEPART@RETURN` (same grammar family as `--segment`) and replaces the positional args; all filter flags (`--currency`, `--stops`, `--class`, `--airlines`, `--time`, `--return-time`, `--passengers`) apply to every trip. Per-trip rows land in the envelope's `results[]` with `status` `ok`/`error`/`skipped`.
+
+Round trips can constrain each leg's departure window independently: `--time` sets the outbound window, `--return-time` sets the return leg's window (falls back to `--time` when unset). Both take the same `H-H` 24h form, e.g. `flight-goat-pp-cli flights SEA HNL 2026-08-01 --return 2026-08-10 --time 6-12 --return-time 17-23` for a morning outbound and evening return.
+
+### Round trip: `--return` alone does not return return-leg options
+
+`--return` alone shows **outbound itineraries only**. Each one's `price` already bundles Google's own auto-picked "cheapest return" total, but no return-leg flight (times, airline, duration) is ever shown — do not read the outbound list as containing both directions, and do not assume the price is for the outbound leg alone.
+
+To see and choose real return-leg options, run the true two-step flow Google's own UI uses. Step 1, `flight-goat-pp-cli flights LHR BCN 2027-03-01 --return 2027-03-18 --agent`, returns outbound options with `flights[0].direction == "outbound"` — note the 1-based position of the one you want. Step 2, `flight-goat-pp-cli flights LHR BCN 2027-03-01 --return 2027-03-18 --select-outbound 1 --agent`, returns real return options priced against that specific outbound: `flights[]` now has `direction == "return"` with independent prices, and the envelope's `selected_outbound` echoes which outbound they're paired with.
+
+`--select-outbound N` is 1-based, counted in the order step 1 returned them. It requires `--return` (round trip only) and does not combine with `--trip` or `--segment` (>=2). Each `Flight` also carries `selection_token` on round-trip outbound rows — the same value the CLI itself uses internally to build the step-2 request — for callers building their own selection flow instead of a fixed index.
+
+Rate-limit semantics:
+
+- Transient 429s are retried automatically (2s/5s/12s backoff) before a command fails.
+- On a persistent 429 a batch stops early — continuing would deepen the IP block — the partial envelope is still emitted, and the exit code is 7 (rate limited).
+- While Google is blocked, `soar` and `explore`/`longhaul` use different backends and keep working; `doctor` documents the same contract under `google_flights`.
+
+### Round trip cheapest dates: `dates --round --duration`
+
+`dates` scans one-way prices by default. Add `--round --duration N` to scan round-trip totals instead — each row is the cheapest combined round-trip price for departing that day and returning `N` nights later, not a separate outbound/return price pair: `flight-goat-pp-cli dates SEA HNL --round --duration 7 --sort --agent`. `--duration` is required with `--round` and must be greater than zero. Each result row carries `return_date` (`departure_date` + `--duration`) alongside `price`, which is already the round-trip total.
 
 # Introduction
 AeroAPI is a simple, query-based API that gives software developers access

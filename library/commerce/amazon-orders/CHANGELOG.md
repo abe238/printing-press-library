@@ -2,6 +2,18 @@
 
 This file is maintained by printing-press-library release automation. Do not hand-edit release sections in normal PRs.
 
+## 2026.9.1 - 2026-09-03
+
+- docs(amazon-orders): clarify headless auth validation (leftover from #1007) (#1917).
+
+## 2026.8.2 - 2026-08-17
+
+- fix(amazon-orders): rebase amazon.in parser fix (#1741).
+
+## 2026.8.1 - 2026-08-17
+
+- fix(catalog): align Go fallback docs with toolchain floor (#1735).
+
 ## 2026.7.2 - 2026-07-08
 
 - fix(catalog): require Go 1.26.5 across published modules (#1467).

@@ -4,6 +4,7 @@
 package cli
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 
@@ -55,6 +56,13 @@ func newItemsListCmd(flags *rootFlags) *cobra.Command {
 
 			list, err := st.FindListByName(bodyListName)
 			if err != nil {
+				if errors.Is(err, store.ErrListNotFound) {
+					if flags.asJSON {
+						return printJSONWithFreshness(cmd.OutOrStdout(), []any{}, flags)
+					}
+					fmt.Fprintf(cmd.OutOrStdout(), "No items found in %q\n", bodyListName)
+					return nil
+				}
 				return err
 			}
 
@@ -85,21 +93,67 @@ func newItemsListCmd(flags *rootFlags) *cobra.Command {
 			}
 
 			if flags.asJSON {
+				type priceJSON struct {
+					Amount  float64 `json:"amount"`
+					Details string  `json:"details,omitempty"`
+					StoreID string  `json:"store_id,omitempty"`
+					Date    string  `json:"date,omitempty"`
+				}
+				type categoryAssignmentJSON struct {
+					ID              string `json:"id,omitempty"`
+					CategoryGroupID string `json:"category_group_id,omitempty"`
+					CategoryID      string `json:"category_id,omitempty"`
+				}
 				type itemJSON struct {
-					ID       string `json:"id"`
-					Name     string `json:"name"`
-					Quantity string `json:"quantity,omitempty"`
-					Category string `json:"category,omitempty"`
-					Checked  bool   `json:"checked"`
+					ID                  string                   `json:"id"`
+					Name                string                   `json:"name"`
+					Quantity            string                   `json:"quantity,omitempty"`
+					Category            string                   `json:"category,omitempty"`
+					PackageSize         string                   `json:"package_size,omitempty"`
+					CategoryMatchID     string                   `json:"category_match_id,omitempty"`
+					Checked             bool                     `json:"checked"`
+					PhotoIDs            []string                 `json:"photo_ids,omitempty"`
+					Prices              []priceJSON              `json:"prices,omitempty"`
+					StoreIDs            []string                 `json:"store_ids,omitempty"`
+					CategoryAssignments []categoryAssignmentJSON `json:"category_assignments,omitempty"`
 				}
 				out := make([]itemJSON, len(items))
 				for i, it := range items {
+					prices := make([]priceJSON, 0, len(it.Prices))
+					for _, price := range it.Prices {
+						if price == nil {
+							continue
+						}
+						prices = append(prices, priceJSON{
+							Amount:  price.GetAmount(),
+							Details: price.GetDetails(),
+							StoreID: price.GetStoreId(),
+							Date:    price.GetDate(),
+						})
+					}
+					assignments := make([]categoryAssignmentJSON, 0, len(it.CategoryAssignments))
+					for _, assignment := range it.CategoryAssignments {
+						if assignment == nil {
+							continue
+						}
+						assignments = append(assignments, categoryAssignmentJSON{
+							ID:              assignment.GetIdentifier(),
+							CategoryGroupID: assignment.GetCategoryGroupId(),
+							CategoryID:      assignment.GetCategoryId(),
+						})
+					}
 					out[i] = itemJSON{
-						ID:       it.ID,
-						Name:     it.Name,
-						Quantity: it.Quantity,
-						Category: it.Category,
-						Checked:  it.Checked,
+						ID:                  it.ID,
+						Name:                it.Name,
+						Quantity:            it.Quantity,
+						Category:            it.Category,
+						PackageSize:         formatPackageSize(it.PackageSize),
+						CategoryMatchID:     it.CategoryMatchID,
+						Checked:             it.Checked,
+						PhotoIDs:            it.PhotoIDs,
+						Prices:              prices,
+						StoreIDs:            it.StoreIDs,
+						CategoryAssignments: assignments,
 					}
 				}
 				return printJSONWithFreshness(cmd.OutOrStdout(), out, flags)

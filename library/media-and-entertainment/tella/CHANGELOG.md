@@ -2,6 +2,14 @@
 
 This file is maintained by printing-press-library release automation. Do not hand-edit release sections in normal PRs.
 
+## 2026.9.1 - 2026-09-01
+
+- feat(tella): add recoverable API editing workflows (#1894).
+
+## 2026.8.1 - 2026-08-17
+
+- fix(catalog): align Go fallback docs with toolchain floor (#1735).
+
 ## 2026.7.1 - 2026-07-08
 
 - fix(catalog): require Go 1.26.5 across published modules (#1467).

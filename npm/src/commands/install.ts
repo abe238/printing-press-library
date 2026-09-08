@@ -55,6 +55,8 @@ interface InstallSummary {
   name: string;
   binary?: string;
   modulePath?: string;
+  /** Immutable catalog commit used for the Go install, when release metadata is available. */
+  sourceCommit?: string;
   skill?: string;
   /**
    * The canonical binary path to recommend to the user. Equals `installedPath`
@@ -222,6 +224,7 @@ async function installOne(
 
     const binary = cliBinaryName(entry);
     const moduleRoot =
+      installModuleOverride(entry) ??
       (await deps.resolveModulePath(entry.path, options.registryUrl)) ??
       `github.com/mvanhorn/printing-press-library/${entry.path}`;
     const modulePath = `${moduleRoot}/cmd/${binary}`;
@@ -240,7 +243,12 @@ async function installOne(
     }
 
     const installEnv = effectiveBinDir ? { ...deps.env, GOBIN: effectiveBinDir } : undefined;
-    const install = await deps.goInstall(modulePath, "latest", installEnv);
+    // Prefer the catalog's full release commit so a later change to main cannot
+    // silently alter the selected build. This pin reduces branch drift; it does
+    // not authenticate the mutable live catalog or the separate skill installer.
+    // Older/unreleased entries keep the historical @latest fallback.
+    const installRef = entry.release?.source_commit ?? "latest";
+    const install = await deps.goInstall(modulePath, installRef, installEnv);
     if (install.code !== 0) {
       deps.stderr(`go install failed for ${modulePath}`);
       if (install.stderr.trim()) {
@@ -263,6 +271,9 @@ async function installOne(
 
     summary.binary = binary;
     summary.modulePath = modulePath;
+    if (entry.release?.source_commit) {
+      summary.sourceCommit = entry.release.source_commit;
+    }
     if (installedPath) {
       summary.installedPath = installedPath;
     }
@@ -300,6 +311,9 @@ async function installOne(
     deps.stdout(`Installed ${entry.name}`);
     if (summary.binaryPath) {
       deps.stdout(`  binary: ${summary.binaryPath}`);
+    }
+    if (summary.sourceCommit) {
+      deps.stdout(`  source commit: ${summary.sourceCommit}`);
     }
     if (summary.shadowedBy) {
       deps.stdout(`  shadowed by: ${summary.shadowedBy} (earlier in PATH)`);
@@ -402,6 +416,13 @@ function reportResults(outcomes: InstallOutcome[], options: InstallOptions, deps
 }
 
 export const installCommand = createInstallCommand();
+
+function installModuleOverride(entry: { name: string; api: string; path: string }): string | null {
+  if (entry.name === "v0" && entry.api === "v0" && entry.path === "library/ai/v0") {
+    return "github.com/mvanhorn/printing-press-library/library/ai/v0/vzero";
+  }
+  return null;
+}
 
 function parseInstallArgs(
   args: string[],

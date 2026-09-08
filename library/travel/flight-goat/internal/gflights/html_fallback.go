@@ -186,6 +186,11 @@ var fetchSearchPage = func(ctx context.Context, pageURL string) (string, error) 
 	if err != nil {
 		return "", fmt.Errorf("reading fallback search page: %w", err)
 	}
+	if resp.StatusCode == http.StatusTooManyRequests {
+		// PATCH(amend-2026-07-31): same sentinel as the RPC path — the block
+		// is IP-level and the HTML body is a useless interstitial.
+		return "", fmt.Errorf("fallback search page: %w", ErrRateLimited)
+	}
 	if resp.StatusCode != http.StatusOK {
 		snippet := string(body)
 		if len(snippet) > 200 {
@@ -323,10 +328,12 @@ func scanBalancedArray(s string) (int, bool) {
 
 // flightsFromEmbeddedPayload walks one decoded blob with the same bucket
 // layout parseOffersResponse uses on the RPC payload (offers at inner[2] and
-// inner[3], rows at bucket[0]) and returns the parsed flights.
-func flightsFromEmbeddedPayload(inner []any, currency string) []Flight {
-	var flights []Flight
-	for _, idx := range []int{2, 3} {
+// inner[3], rows at bucket[0]) and returns the parsed flights, plus the
+// count of leading entries that belong to the outbound bucket (inner[2]) so
+// callers that need to apply a different filter to the return leg (see
+// ReturnTimeWindow) can split flights[:outboundCount] / flights[outboundCount:].
+func flightsFromEmbeddedPayload(inner []any, currency string) (flights []Flight, outboundCount int) {
+	for i, idx := range []int{2, 3} {
 		if idx >= len(inner) {
 			continue
 		}
@@ -345,27 +352,33 @@ func flightsFromEmbeddedPayload(inner []any, currency string) []Flight {
 			}
 			flights = append(flights, f)
 		}
+		if i == 0 {
+			outboundCount = len(flights)
+		}
 	}
-	return flights
+	return flights, outboundCount
 }
 
 // flightsFromHTML extracts every AF_initDataCallback blob and returns the
 // flights from the blob that yields the most itineraries (the page carries
-// several unrelated blobs; only one embeds the shopping results).
-func flightsFromHTML(html, currency string) []Flight {
+// several unrelated blobs; only one embeds the shopping results), plus the
+// outbound/return split (see flightsFromEmbeddedPayload).
+func flightsFromHTML(html, currency string) ([]Flight, int) {
 	var best []Flight
+	var bestOutboundCount int
 	blobs := append(extractInitDataBlobs(html), extractDS1ScriptBlobs(html)...)
 	for _, blob := range blobs {
 		var inner []any
 		if err := json.Unmarshal([]byte(blob), &inner); err != nil {
 			continue
 		}
-		flights := flightsFromEmbeddedPayload(inner, currency)
+		flights, outboundCount := flightsFromEmbeddedPayload(inner, currency)
 		if len(flights) > len(best) {
 			best = flights
+			bestOutboundCount = outboundCount
 		}
 	}
-	return best
+	return best, bestOutboundCount
 }
 
 // searchViaHTML is the fallback search path. Filters Google's RPC accepted
@@ -382,12 +395,38 @@ func searchViaHTML(ctx context.Context, opts SearchOptions, currencyCode string)
 	if err != nil {
 		return nil, "", err
 	}
-	flights := flightsFromHTML(html, currencyCode)
+	flights, outboundCount := flightsFromHTML(html, currencyCode)
 	if len(flights) == 0 && pageMissingFlightData(html) {
 		return nil, "", errors.New("fallback page did not embed flight data — Google likely served a consent " +
 			"interstitial (the built-in SOCS consent cookie may have gone stale) or redesigned the page")
 	}
-	flights = filterFlightsClientSide(flights, opts)
+	// PATCH(library): the return leg gets its own time window when
+	// ReturnTimeWindow is set — filter the outbound and return buckets
+	// separately rather than applying one window to the flat list (which
+	// used to filter both legs identically). Falls back to TimeWindow for
+	// the return leg when ReturnTimeWindow is unset, matching prior behavior.
+	outboundOpts, returnOpts := opts, opts
+	if opts.ReturnTimeWindow != "" {
+		returnOpts.TimeWindow = opts.ReturnTimeWindow
+	}
+	outbound := filterFlightsClientSide(append([]Flight(nil), flights[:outboundCount]...), outboundOpts)
+	inbound := filterFlightsClientSide(append([]Flight(nil), flights[outboundCount:]...), returnOpts)
+	// PATCH(library): tag direction from the already-established
+	// outboundCount boundary (see TestFlightsFromEmbeddedPayload_OutboundReturnSplit)
+	// rather than guessing from airport codes — round trip only; a one-way
+	// search has nothing in the return bucket so outbound/inbound collapse
+	// to the same untagged list. See gflights.go's SelectOutbound doc; the
+	// native RPC path (flights_native.go) has no equivalent bucket split and
+	// tags Direction itself from request shape instead.
+	if opts.ReturnDate != "" {
+		for i := range outbound {
+			outbound[i].Direction = "outbound"
+		}
+		for i := range inbound {
+			inbound[i].Direction = "return"
+		}
+	}
+	flights = append(outbound, inbound...)
 	note := htmlFallbackNote
 	if !sortFlightsClientSide(flights, opts.SortBy) {
 		note += fmt.Sprintf(htmlFallbackSortNote, opts.SortBy)
@@ -485,6 +524,37 @@ func filterFlightsClientSide(flights []Flight, opts SearchOptions) []Flight {
 	return out
 }
 
+// cheapestFallbackCandidate picks the cheapest priced flight to report for
+// one fallback day. On a round-trip page the "return" bucket holds
+// incremental fares priced against whatever outbound the page pre-selected,
+// not standalone round-trip totals — picking the global cheapest across both
+// buckets can surface a partial fare. The "outbound" bucket's Price is
+// already the full round-trip total for that itinerary (same convention
+// flights_native.go's first-fetch round-trip response uses), so round-trip
+// callers restrict to it; one-way callers (roundTrip=false) consider every
+// flight since there is only one bucket.
+func cheapestFallbackCandidate(flights []Flight, roundTrip bool) *Flight {
+	candidates := flights
+	if roundTrip {
+		candidates = nil
+		for i := range flights {
+			if flights[i].Direction == "outbound" {
+				candidates = append(candidates, flights[i])
+			}
+		}
+	}
+	var cheapest *Flight
+	for i := range candidates {
+		if candidates[i].Price <= 0 {
+			continue
+		}
+		if cheapest == nil || candidates[i].Price < cheapest.Price {
+			cheapest = &candidates[i]
+		}
+	}
+	return cheapest
+}
+
 // datesViaHTML serves the cheapest-dates query when the calendar RPC is
 // blocked: one server-rendered page per day, cheapest itinerary kept.
 // Bounded concurrency keeps the fan-out polite; individual day failures are
@@ -515,10 +585,15 @@ func datesViaHTML(ctx context.Context, opts DatesOptions, from, to time.Time, cu
 				results[i] = dayResult{idx: i, err: ctx.Err()}
 				return
 			}
+			var returnDate string
+			if opts.RoundTrip {
+				returnDate = day.AddDate(0, 0, opts.Duration).Format("2006-01-02")
+			}
 			searchOpts := SearchOptions{
 				Origin:        opts.Origin,
 				Destination:   opts.Destination,
 				DepartureDate: day.Format("2006-01-02"),
+				ReturnDate:    returnDate,
 				Airlines:      opts.Airlines,
 				CabinClass:    opts.CabinClass,
 				MaxStops:      opts.MaxStops,
@@ -528,21 +603,14 @@ func datesViaHTML(ctx context.Context, opts DatesOptions, from, to time.Time, cu
 				results[i] = dayResult{idx: i, err: err}
 				return
 			}
-			var cheapest *Flight
-			for j := range flights {
-				if flights[j].Price <= 0 {
-					continue
-				}
-				if cheapest == nil || flights[j].Price < cheapest.Price {
-					cheapest = &flights[j]
-				}
-			}
+			cheapest := cheapestFallbackCandidate(flights, opts.RoundTrip)
 			if cheapest == nil {
 				results[i] = dayResult{idx: i}
 				return
 			}
 			results[i] = dayResult{idx: i, price: &DatePrice{
 				DepartureDate: day.Format("2006-01-02"),
+				ReturnDate:    returnDate,
 				Price:         cheapest.Price,
 				Currency:      currencyCode,
 			}}
@@ -553,9 +621,13 @@ func datesViaHTML(ctx context.Context, opts DatesOptions, from, to time.Time, cu
 	var out []DatePrice
 	var firstErr error
 	failedDays := 0
+	rateLimited := false
 	for _, r := range results {
 		if r.err != nil {
 			failedDays++
+			if errors.Is(r.err, ErrRateLimited) {
+				rateLimited = true
+			}
 			if firstErr == nil {
 				firstErr = r.err
 			}
@@ -564,12 +636,23 @@ func datesViaHTML(ctx context.Context, opts DatesOptions, from, to time.Time, cu
 			out = append(out, *r.price)
 		}
 	}
+	// PATCH(review-2026-07-31): a 429 mid-range must never read as a clean
+	// success. With zero usable days, surface the typed rate-limit error so
+	// the CLI exits 7 with the pacing hint; with partial days, keep the data
+	// (partial results are the point) but name the rate limit in the note so
+	// agents see the coverage is incomplete and why.
+	if len(out) == 0 && rateLimited {
+		return nil, "", fmt.Errorf("dates HTML fallback: %w", ErrRateLimited)
+	}
 	if len(out) == 0 && firstErr != nil {
 		return nil, "", fmt.Errorf("dates HTML fallback failed for every day in range: %w", firstErr)
 	}
 	note := htmlFallbackNote
 	if failedDays > 0 {
 		note += fmt.Sprintf("; %d day(s) in range could not be fetched and are absent from the result", failedDays)
+		if rateLimited {
+			note += " (google rate limited some fetches — HTTP 429; date coverage is incomplete, retry later or space queries)"
+		}
 	}
 	return out, note, nil
 }

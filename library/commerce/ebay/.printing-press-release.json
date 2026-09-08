@@ -2,16 +2,16 @@
   "schema_version": 1,
   "slug": "ebay",
   "cli_name": "ebay-pp-cli",
-  "version": "2026.7.2",
-  "released_at": "2026-07-08T22:18:26Z",
-  "source_commit": "8d08fedcf337579edd0b8f0f9ec9b7cc67870fb6",
+  "version": "2026.8.3",
+  "released_at": "2026-08-30T09:08:18Z",
+  "source_commit": "d97ee8c93245eee634bbf3f75541341e48fbfc44",
   "printing_press_version": "3.0.1",
   "changes": [
     {
-      "title": "fix(ebay): preserve commerce fields in agent compact output",
-      "pr": 1424,
-      "url": "https://github.com/mvanhorn/printing-press-library/pull/1424",
-      "commit": "8d08fedcf337579edd0b8f0f9ec9b7cc67870fb6"
+      "title": "fix: bump github.com/enetx/http to v1.0.29 across 68 modules",
+      "pr": 1865,
+      "url": "https://github.com/mvanhorn/printing-press-library/pull/1865",
+      "commit": "d97ee8c93245eee634bbf3f75541341e48fbfc44"
     }
   ]
 }

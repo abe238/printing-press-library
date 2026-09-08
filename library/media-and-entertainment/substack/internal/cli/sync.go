@@ -394,7 +394,7 @@ Resource scoping:
 	cmd.Flags().IntVar(&maxPages, "max-pages", 0, "Maximum pages to fetch per resource (0 = unlimited; cap-hit emits a sync_warning event)")
 	cmd.Flags().BoolVar(&latestOnly, "latest-only", false, "Refresh head of each resource only; clears resume cursor and caps pages at 1. Mutually exclusive with --since (--since wins).")
 	cmd.Flags().BoolVar(&strict, "strict", false, "Exit non-zero on any per-resource failure (default: only critical failures or all-resource failure exit non-zero).")
-	cmd.Flags().StringArrayVar(&paramFlags, "param", nil, "Extra query param to inject into flat-list sync requests (repeatable, key=value). Skipped on path-scoped dependent requests so a top-level scope like workspace=<id> does not double up on /parents/<id>/children calls. Use --global-param to inject everywhere. Avoid pagination keys (limit/since/cursor) — overriding them corrupts resume state.")
+	cmd.Flags().StringArrayVar(&paramFlags, "param", nil, "Extra query param to inject into flat-list sync requests (repeatable, key=value). Skipped on path-scoped dependent requests so a top-level scope like workspace=<id> does not double up on /parents/<id>/children calls. Use --global-param to inject everywhere. Limit overrides are honoured within the endpoint cap; avoid overriding since/cursor because they can corrupt resume state.")
 	cmd.Flags().StringArrayVar(&resourceParamFlags, "resource-param", nil, "Per-resource extra query param (repeatable, resource:key=value). Wins over --param and --global-param when keys conflict.")
 	cmd.Flags().StringArrayVar(&globalParamFlags, "global-param", nil, "Extra query param to inject into every sync request including dependent path-scoped calls (repeatable, key=value). Use when an API requires a scope on every call regardless of path nesting.")
 	cmd.Flags().StringArrayVar(&pathContextFlags, "path-context", nil, "Fill a {key} placeholder in BaseURL or request paths from a supplied value (repeatable, key=value). Wins over env-resolved Config.TemplateVars values, so it doubles as a one-off override at the call site. Use it when an env variable already holds a different value, or when the spec did not annotate the placeholder with an env var.")
@@ -508,7 +508,7 @@ func syncResource(ctx context.Context, c interface {
 	}
 
 	cursor := existingCursor
-	pageSize := determinePaginationDefaults()
+	pageSize := paginationForResource(resource)
 
 	var progressCount int64
 	pagesFetched := 0
@@ -551,6 +551,15 @@ func syncResource(ctx context.Context, c interface {
 		// win over spec-derived defaults (e.g. forcing mine=true on a list
 		// endpoint whose OpenAPI spec marks the filter optional).
 		userParams.applyTo(resource, params, false)
+
+		// Reconcile the final request limit after user overrides. The request
+		// value, short-page check, and offset stride must use one effective
+		// page size or pagination can fail, stop early, or skip records.
+		if resourceSupportsPagination(resource) {
+			if err := reconcileSyncPageSize(resource, &pageSize, params); err != nil {
+				return syncResult{Resource: resource, Count: totalCount, Err: err, Duration: time.Since(started)}
+			}
+		}
 		if resource == "drafts" && basePublicationID != "" && params["publication_id"] != basePublicationID && !publicationParamWarningEmitted {
 			msg := fmt.Sprintf("user-supplied publication_id %q overrides auto-resolved drafts publication_id %q", params["publication_id"], basePublicationID)
 			if !humanFriendly {
@@ -797,6 +806,64 @@ func determinePaginationDefaults() paginationDefaults {
 	}
 }
 
+// paginationForResource returns the sync paginator for one resource.
+// GET /reader/subscriptions uses an opaque cursor, not the generated offset default.
+func paginationForResource(resource string) paginationDefaults {
+	pageSize := determinePaginationDefaults()
+	if resource == "reader" {
+		pageSize.cursorParam = "cursor"
+		pageSize.cursorType = "cursor"
+	}
+	return pageSize
+}
+
+// substackMaxPageSize is the largest limit Substack's list endpoints accept.
+// Anything above it is rejected with HTTP 400
+// {"errors":[{"location":"query","param":"limit","msg":"Invalid value"}]},
+// which fails the whole resource rather than just the page. The spec the
+// generator reads does not describe this cap, so the derived page size sits
+// above it. The cap is server-side and re-measurable: a reprint must probe it
+// again rather than trust the page size the spec implies.
+const substackMaxPageSize = 50
+
+// clampSyncPageSize lowers a generated page size to what the resource's
+// endpoint accepts, leaving an already-smaller size alone.
+// /post_management/published caps lower than the rest, at
+// publishedPostsPageSize.
+//
+// Callers apply this to paginationDefaults.limit, which drives the request
+// limit, the short-page stop check, and the offset stride together, so
+// clamping the one value keeps those three in agreement. Lowering only the
+// request limit would leave the stride skipping unread records.
+func clampSyncPageSize(resource string, generatedLimit int) int {
+	maxPageSize := substackMaxPageSize
+	if resource == "posts-published" {
+		maxPageSize = publishedPostsPageSize
+	}
+	if generatedLimit < maxPageSize {
+		return generatedLimit
+	}
+	return maxPageSize
+}
+
+// reconcileSyncPageSize reads the final limit after user parameters have
+// been applied, clamps it to the resource's endpoint cap, and writes the same
+// effective value back to both the request and the paginator state.
+func reconcileSyncPageSize(resource string, pageSize *paginationDefaults, params map[string]string) error {
+	rawLimit, ok := params[pageSize.limitParam]
+	if !ok {
+		return fmt.Errorf("pagination parameter %q is missing for %s", pageSize.limitParam, resource)
+	}
+	requestedLimit, err := strconv.Atoi(rawLimit)
+	if err != nil || requestedLimit <= 0 {
+		return fmt.Errorf("invalid pagination %s %q for %s: expected a positive integer", pageSize.limitParam, rawLimit, resource)
+	}
+
+	pageSize.limit = clampSyncPageSize(resource, requestedLimit)
+	params[pageSize.limitParam] = strconv.Itoa(pageSize.limit)
+	return nil
+}
+
 func resourceSupportsPagination(resource string) bool {
 	switch resource {
 	case "drafts":
@@ -804,6 +871,8 @@ func resourceSupportsPagination(resource string) bool {
 	case "posts":
 		return true
 	case "posts-published":
+		return true
+	case "reader": // PATCH(reader-subscriptions-list): opaque cursor pages, not a single response.
 		return true
 	}
 	return false
@@ -1289,6 +1358,7 @@ func defaultSyncResources() []string {
 		"posts-published",
 		"posts-ranked",
 		"profiles",
+		"reader",
 		"sections",
 		"subs",
 		"tags",
@@ -1308,6 +1378,7 @@ func knownSyncResourceNames() []string {
 		"posts-published",
 		"posts-ranked",
 		"profiles",
+		"reader",
 		"sections",
 		"subs",
 		"tags",
@@ -1328,6 +1399,7 @@ func syncResourcePath(resource string) (string, error) {
 		"posts-published": publicationAPIPath("/post_management/published"),
 		"posts-ranked":    publicationAPIPath("/publication/users/ranked"),
 		"profiles":        "/handle/options",
+		"reader":          "/reader/subscriptions",
 		"sections":        publicationAPIPath("/subscriptions"),
 		"subs":            publicationAPIPath("/publication/users"),
 		"tags":            publicationAPIPath("/publication/post-tag"),
@@ -1347,7 +1419,10 @@ func syncResourcePath(resource string) (string, error) {
 // Includes both flat resources and dependent (parent-child) resources so
 // annotations on a child path-item are honored at runtime, not just on
 // flat paths.
-var resourceIDFieldOverrides = map[string]string{}
+var resourceIDFieldOverrides = map[string]string{
+	// PATCH(reader-subscriptions-list): GET /reader/subscriptions rows key on subscription_id.
+	"reader": "subscription_id",
+}
 
 // genericIDFieldFallbacks is the runtime safety net for resources that did
 // NOT receive a templated IDField. API-specific names belong in spec

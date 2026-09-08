@@ -2,17 +2,17 @@
   "schema_version": 1,
   "slug": "tella",
   "cli_name": "tella-pp-cli",
-  "version": "2026.7.1",
-  "released_at": "2026-07-08T18:21:21Z",
-  "source_commit": "11d7b4ea752c9c8fb8909037133058eb57560cc0",
+  "version": "2026.9.1",
+  "released_at": "2026-09-01T09:06:13Z",
+  "source_commit": "bae6a5a7367da96c7910fc5b6fd321ff0ad834fa",
   "printing_press_version": "4.2.1",
   "run_id": "20260509-180956",
   "changes": [
     {
-      "title": "fix(catalog): require Go 1.26.5 across published modules",
-      "pr": 1467,
-      "url": "https://github.com/mvanhorn/printing-press-library/pull/1467",
-      "commit": "11d7b4ea752c9c8fb8909037133058eb57560cc0"
+      "title": "feat(tella): add recoverable API editing workflows",
+      "pr": 1894,
+      "url": "https://github.com/mvanhorn/printing-press-library/pull/1894",
+      "commit": "bae6a5a7367da96c7910fc5b6fd321ff0ad834fa"
     }
   ]
 }

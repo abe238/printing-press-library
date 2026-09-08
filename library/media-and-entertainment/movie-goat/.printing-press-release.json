@@ -2,17 +2,17 @@
   "schema_version": 1,
   "slug": "movie-goat",
   "cli_name": "movie-goat-pp-cli",
-  "version": "2026.7.2",
-  "released_at": "2026-07-08T23:15:22Z",
-  "source_commit": "220c1563d0375ec8741c4c377b4bb5a4317cbf6a",
+  "version": "2026.9.1",
+  "released_at": "2026-09-01T09:07:10Z",
+  "source_commit": "34f1153694c1bad43dc6dddcdfb98c6831faeee2",
   "printing_press_version": "3.8.0",
   "run_id": "20260504-004256",
   "changes": [
     {
-      "title": "feat: registry hygiene follow-ups (pp-first descriptions, expanded MCP validation, --validate for skills, npm publish auto-trigger)",
-      "pr": 675,
-      "url": "https://github.com/mvanhorn/printing-press-library/pull/675",
-      "commit": "220c1563d0375ec8741c4c377b4bb5a4317cbf6a"
+      "title": "fix(movie-goat): make untyped local search return FTS hits",
+      "pr": 1893,
+      "url": "https://github.com/mvanhorn/printing-press-library/pull/1893",
+      "commit": "34f1153694c1bad43dc6dddcdfb98c6831faeee2"
     }
   ]
 }
